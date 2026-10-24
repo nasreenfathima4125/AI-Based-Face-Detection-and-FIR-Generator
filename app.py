@@ -2,21 +2,31 @@
 app.py
 ------
 Integrated AI Surveillance and FIR Assistance System
-Public Safety Multi-Page Application
 
-Features:
-1. Landing Page (Default screen with system purpose, workflow, and action triggers).
-2. Complaint-First Conversational Reporting (Multilingual chatbot flow: English, Malayalam, Hindi).
-3. Incident Verification Screen (Document-like review before final confirmation).
-4. Submission Confirmation & Account Creation Invitation.
-5. Role-Based Login & Dashboards (Citizen, Police Officer, Administrator).
-6. Strict adherence to BRAND_GUIDELINES.md and research prototype transparency.
+A professional public-service platform for multilingual citizen complaint intake
+and assisted First Information Report (FIR) drafting.
+
+Architecture & Design System:
+- Strict Palette: Warm Beige (#F3EBDD), Ivory (#FFFCF6), Dark Espresso (#493A2D),
+  Deep Teal (#356B68), Muted Olive (#68745B), Muted Red (#A64B43), Readable Brown (#6B5B4D).
+- Typography: Inter with Unicode fallbacks for Malayalam and Hindi.
+- Storage: Relational SQLite database (database.py) with full restart persistence.
+- Security: Salted PBKDF2 hashing, phone-matched complaint ownership verification, immutable audit logging.
+- Workflows:
+  1. Minimal, editorial Landing Page (Headline, CTA, Unsplash editorial photograph).
+  2. Language selection -> Focused conversational intake assistant -> Guided form fallback.
+  3. Structured fact verification -> Persistent save & reference number -> Account linking.
+  4. Police Review Workspace: Complaint Queue + Side-by-side fact inspection & Malayalam FIR draft review.
+  5. Citizen Dashboard: Linked complaints with locked FIR download policy until police approval.
+  6. Administrator Portal: Role assignment, audit logs, and module telemetry.
 """
 
-from datetime import date
+from datetime import date, datetime
+import os
 from typing import List, Dict, Any, Optional
 import streamlit as st
 
+import database
 from complaint_manager import (
     SUPPORTED_CATEGORIES,
     COMPLAINT_CATEGORIES,
@@ -25,162 +35,303 @@ from complaint_manager import (
     get_step_prompt,
     validate_chat_step_input,
     validate_complaint_input,
-    compute_submission_fingerprint,
-    create_complaint_record,
+    generate_malayalam_fir_draft,
 )
 
 
+# ==============================================================================
+# SESSION STATE INITIALIZATION
+# ==============================================================================
 def init_session_state() -> None:
-    """Initializes session state keys for navigation, chat, and complaint tracking."""
+    """Initializes session state for persistent routing and user sessions."""
     if "current_page" not in st.session_state:
         st.session_state["current_page"] = "landing"
-    if "user_role" not in st.session_state:
-        st.session_state["user_role"] = None
-    if "complaints" not in st.session_state:
-        st.session_state["complaints"] = []
-    if "last_submission_id" not in st.session_state:
-        st.session_state["last_submission_id"] = None
-    if "last_submission_fingerprint" not in st.session_state:
-        st.session_state["last_submission_fingerprint"] = None
-
-    # Conversational chat state
+    if "auth_user" not in st.session_state:
+        st.session_state["auth_user"] = None
+    if "selected_language" not in st.session_state:
+        st.session_state["selected_language"] = "en"
+    if "complaint_slots" not in st.session_state:
+        st.session_state["complaint_slots"] = create_empty_complaint_slots("en")
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
     if "chat_step_index" not in st.session_state:
         st.session_state["chat_step_index"] = 0
-    if "complaint_slots" not in st.session_state:
-        st.session_state["complaint_slots"] = create_empty_complaint_slots()
-    if "is_editing_verification" not in st.session_state:
-        st.session_state["is_editing_verification"] = False
+    if "last_submitted_ref" not in st.session_state:
+        st.session_state["last_submitted_ref"] = None
+    if "last_submitted_id" not in st.session_state:
+        st.session_state["last_submitted_id"] = None
+    if "active_police_case_id" not in st.session_state:
+        st.session_state["active_police_case_id"] = None
 
 
-def navigate_to(page_name: str) -> None:
-    """Safely updates navigation page in session state."""
-    st.session_state["current_page"] = page_name
+def navigate_to(page: str) -> None:
+    """Safely transitions between pages and triggers a rerun."""
+    st.session_state["current_page"] = page
     st.rerun()
 
 
-def reset_chat_state() -> None:
-    """Resets the complaint conversation slots and messages."""
+def reset_intake() -> None:
+    """Resets conversational slots and chat messages."""
+    lang = st.session_state.get("selected_language", "en")
+    st.session_state["complaint_slots"] = create_empty_complaint_slots(lang)
     st.session_state["chat_messages"] = []
     st.session_state["chat_step_index"] = 0
-    st.session_state["complaint_slots"] = create_empty_complaint_slots()
-    st.session_state["is_editing_verification"] = False
 
 
+# ==============================================================================
+# DESIGN SYSTEM & GLOBAL CSS
+# ==============================================================================
 def apply_custom_styles() -> None:
-    """Applies clean, restrained CSS styling following BRAND_GUIDELINES.md."""
+    """
+    Applies strict Warm Beige / Ivory / Dark Espresso / Deep Teal design tokens.
+    Guarantees readable contrast everywhere and eliminates dark-mode bleed-through.
+    """
     st.markdown(
         """
         <style>
-        /* Base typography */
-        html, body, [class*="css"] {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, 
-                         "Noto Sans Malayalam", "Noto Sans Devanagari", sans-serif;
-            color: #1F2937;
+        /* -------------------------------------------------------------
+           1. Global Base Typography & Colors
+           ------------------------------------------------------------- */
+        html, body, [class*="css"], .stApp {
+            background-color: #F3EBDD !important;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, 
+                         "Noto Sans Malayalam", "Noto Sans Devanagari", sans-serif !important;
+            color: #493A2D !important;
         }
 
-        /* Top disclaimer banner */
-        .disclaimer-banner {
-            background-color: #F4F6F8;
-            border-left: 4px solid #17365D;
-            border-top: 1px solid #D9E0E7;
-            border-right: 1px solid #D9E0E7;
-            border-bottom: 1px solid #D9E0E7;
-            padding: 12px 16px;
-            border-radius: 4px;
-            font-size: 0.88rem;
-            color: #1F2937;
-            margin-bottom: 20px;
+        /* Enforce Dark Espresso on all standard textual elements */
+        p, span, div, li, h1, h2, h3, h4, h5, h6, label {
+            color: #493A2D !important;
         }
 
-        .disclaimer-banner strong {
-            color: #17365D;
+        /* Secondary text color */
+        .text-secondary, .stCaption, small {
+            color: #6B5B4D !important;
         }
 
-        /* Content card styling */
-        .app-card {
-            background-color: #FFFFFF;
-            border: 1px solid #D9E0E7;
-            border-radius: 8px;
-            padding: 22px;
-            margin-bottom: 18px;
-        }
-
-        .app-card:hover {
-            border-color: #315B86;
-        }
-
-        /* Hero banner on Landing Page */
-        .hero-banner {
-            background-color: #F8FAFC;
-            border: 1px solid #D9E0E7;
-            border-radius: 8px;
-            padding: 28px;
+        /* -------------------------------------------------------------
+           2. Top Navigation Bar
+           ------------------------------------------------------------- */
+        .top-navbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 18px;
+            background-color: #FFFCF6;
+            border-bottom: 1px solid #E2D7C3;
             margin-bottom: 24px;
-            border-top: 4px solid #17365D;
-        }
-
-        /* Workflow step box */
-        .step-card {
-            background-color: #FFFFFF;
-            border: 1px solid #D9E0E7;
             border-radius: 6px;
-            padding: 16px;
-            height: 100%;
         }
 
-        .step-number {
-            display: inline-block;
-            background-color: #17365D;
-            color: #FFFFFF;
-            font-weight: 700;
-            border-radius: 50%;
-            width: 26px;
-            height: 26px;
-            text-align: center;
-            line-height: 26px;
-            font-size: 0.82rem;
-            margin-bottom: 8px;
+        /* -------------------------------------------------------------
+           3. Content Surfaces & Cards
+           ------------------------------------------------------------- */
+        .editorial-card {
+            background-color: #FFFCF6 !important;
+            border: 1px solid #E2D7C3 !important;
+            border-radius: 6px !important;
+            padding: 26px !important;
+            margin-bottom: 20px !important;
         }
 
-        /* Status badge */
-        .status-badge {
+        .auth-container {
+            max-width: 460px;
+            margin: 20px auto;
+            background-color: #FFFCF6;
+            border: 1px solid #E2D7C3;
+            border-radius: 6px;
+            padding: 32px;
+        }
+
+        /* -------------------------------------------------------------
+           4. Form Controls & Inputs (Ivory background with dark text)
+           ------------------------------------------------------------- */
+        label, [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] span {
+            color: #493A2D !important;
+            font-weight: 600 !important;
+            font-size: 0.92rem !important;
+        }
+
+        .stTextInput input, 
+        .stTextArea textarea, 
+        .stSelectbox div[data-baseweb="select"] > div,
+        input[type="text"],
+        input[type="password"],
+        input[type="email"] {
+            background-color: #FFFCF6 !important;
+            color: #493A2D !important;
+            border: 1px solid #D5CCC0 !important;
+            border-radius: 4px !important;
+            font-size: 0.95rem !important;
+        }
+
+        .stTextInput input:focus, 
+        .stTextArea textarea:focus,
+        .stSelectbox div[data-baseweb="select"] > div:focus-within {
+            border-color: #356B68 !important;
+            box-shadow: 0 0 0 1px #356B68 !important;
+            outline: none !important;
+        }
+
+        input::placeholder, textarea::placeholder {
+            color: #8C7B6D !important;
+            opacity: 1 !important;
+        }
+
+        /* -------------------------------------------------------------
+           5. Buttons (Deep Teal Primary & Ivory Secondary)
+           ------------------------------------------------------------- */
+        /* Primary buttons: Deep Teal */
+        button[data-testid="baseButton-primary"],
+        button[data-testid="stBaseButton-primary"],
+        button[kind="primary"],
+        .stButton > button[kind="primary"],
+        div[data-testid="stFormSubmitButton"] > button[kind="primary"],
+        div[data-testid="stFormSubmitButton"] > button {
+            background-color: #356B68 !important;
+            border: 1px solid #356B68 !important;
+            color: #FFFCF6 !important;
+            font-weight: 600 !important;
+            border-radius: 4px !important;
+            padding: 8px 18px !important;
+        }
+
+        button[data-testid="baseButton-primary"] *,
+        button[data-testid="stBaseButton-primary"] *,
+        button[kind="primary"] *,
+        div[data-testid="stFormSubmitButton"] > button * {
+            color: #FFFCF6 !important;
+        }
+
+        button[data-testid="baseButton-primary"]:hover,
+        button[data-testid="stBaseButton-primary"]:hover,
+        button[kind="primary"]:hover,
+        div[data-testid="stFormSubmitButton"] > button:hover {
+            background-color: #275250 !important;
+            border-color: #275250 !important;
+            color: #FFFCF6 !important;
+        }
+
+        /* Secondary buttons: Ivory surface with espresso text */
+        button[data-testid="baseButton-secondary"],
+        button[data-testid="stBaseButton-secondary"],
+        button[kind="secondary"],
+        .stButton > button {
+            background-color: #FFFCF6 !important;
+            border: 1px solid #D5CCC0 !important;
+            color: #493A2D !important;
+            font-weight: 500 !important;
+            border-radius: 4px !important;
+        }
+
+        button[data-testid="baseButton-secondary"] *,
+        button[data-testid="stBaseButton-secondary"] *,
+        .stButton > button * {
+            color: #493A2D !important;
+        }
+
+        button[data-testid="baseButton-secondary"]:hover,
+        button[data-testid="stBaseButton-secondary"]:hover,
+        .stButton > button:hover {
+            background-color: #F3EBDD !important;
+            border-color: #356B68 !important;
+            color: #356B68 !important;
+        }
+
+        /* -------------------------------------------------------------
+           6. Chat Conversation Bubbles & Input
+           ------------------------------------------------------------- */
+        [data-testid="stChatMessage"] {
+            background-color: #FFFCF6 !important;
+            border: 1px solid #E2D7C3 !important;
+            border-radius: 8px !important;
+            padding: 14px 18px !important;
+            margin-bottom: 12px !important;
+        }
+
+        [data-testid="stChatMessage"] * {
+            color: #493A2D !important;
+        }
+
+        [data-testid="stChatInput"] {
+            background-color: #FFFCF6 !important;
+            border: 1px solid #C4B6A3 !important;
+            border-radius: 6px !important;
+        }
+
+        [data-testid="stChatInput"] textarea {
+            background-color: #FFFCF6 !important;
+            color: #493A2D !important;
+            font-size: 0.95rem !important;
+        }
+
+        [data-testid="stChatInput"] textarea::placeholder {
+            color: #8C7B6D !important;
+        }
+
+        [data-testid="stChatInput"] button {
+            color: #356B68 !important;
+        }
+
+        /* -------------------------------------------------------------
+           7. Status Indicators, Callouts & Expanders
+           ------------------------------------------------------------- */
+        .status-pill {
             display: inline-block;
             padding: 4px 10px;
             border-radius: 4px;
             font-size: 0.82rem;
             font-weight: 600;
-            margin-bottom: 8px;
+        }
+        .pill-submitted { background-color: #E6EDE8; color: #68745B !important; border: 1px solid #C4D3C7; }
+        .pill-review { background-color: #F8EFE4; color: #A66E38 !important; border: 1px solid #E8D3BA; }
+        .pill-approved { background-color: #E2ECEB; color: #356B68 !important; border: 1px solid #ADC7C5; }
+        .pill-returned { background-color: #FAECEB; color: #A64B43 !important; border: 1px solid #E4B5B1; }
+        .pill-locked { background-color: #EDE8DE; color: #73695C !important; border: 1px solid #D5CCC0; }
+
+        div[data-testid="stAlert"] {
+            border-radius: 6px !important;
+            padding: 12px 16px !important;
         }
 
-        .badge-pending {
-            background-color: #FEF3C7;
-            color: #B7791F;
-            border: 1px solid #FCD34D;
+        [data-testid="stExpander"] {
+            background-color: #FFFCF6 !important;
+            border: 1px solid #E2D7C3 !important;
+            border-radius: 6px !important;
+            margin-bottom: 12px !important;
         }
 
-        .badge-info {
-            background-color: #EFF6FF;
-            color: #315B86;
-            border: 1px solid #BFDBFE;
+        [data-testid="stExpander"] summary {
+            color: #493A2D !important;
+            font-weight: 600 !important;
         }
 
-        .badge-locked {
-            background-color: #F3F4F6;
-            color: #6B7280;
-            border: 1px solid #E5E7EB;
+        /* -------------------------------------------------------------
+           8. Editorial Hero Layout
+           ------------------------------------------------------------- */
+        .hero-title {
+            font-size: 2.5rem;
+            font-weight: 800;
+            line-height: 1.15;
+            color: #493A2D;
+            margin-bottom: 14px;
+            letter-spacing: -0.5px;
         }
 
-        /* Primary button styling */
-        button[kind="primary"] {
-            background-color: #17365D !important;
-            border-color: #17365D !important;
-            color: #FFFFFF !important;
+        .hero-subtitle {
+            font-size: 1.15rem;
+            color: #493A2D;
+            line-height: 1.55;
+            margin-bottom: 24px;
         }
-        button[kind="primary"]:hover {
-            background-color: #10243A !important;
-            border-color: #10243A !important;
+
+        .editorial-disclaimer {
+            font-size: 0.82rem;
+            color: #6B5B4D;
+            border-top: 1px solid #E2D7C3;
+            padding-top: 16px;
+            margin-top: 40px;
+            line-height: 1.45;
         }
         </style>
         """,
@@ -188,842 +339,1091 @@ def apply_custom_styles() -> None:
     )
 
 
-def render_header() -> None:
-    """Renders the standard system header and research prototype disclaimer."""
-    st.markdown(
-        """
-        <div style="border-bottom: 2px solid #17365D; padding-bottom: 8px; margin-bottom: 12px;">
-            <h2 style="color: #17365D; margin-bottom: 2px;">
-                Integrated AI Surveillance and FIR Assistance System
-            </h2>
-            <p style="color: #5B6573; margin-top: 0px; font-size: 0.95rem;">
-                Public Safety Intelligence & Multilingual Complaint Management Platform
-            </p>
-        </div>
-        <div class="disclaimer-banner">
-            <strong>⚠️ Research Demonstration Prototype — Not an Official Police Portal</strong><br>
-            This system is an operational research prototype. Submissions and AI drafts generated within this 
-            environment do not represent officially registered First Information Reports (FIRs) or legal police records.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# ==============================================================================
+# COMPACT TOP NAVIGATION HEADER
+# ==============================================================================
+def render_top_navbar() -> None:
+    """Renders the top navigation header with clean public-service actions."""
+    auth_user = st.session_state.get("auth_user")
 
-
-def render_sidebar() -> None:
-    """Renders persistent sidebar navigation and role status."""
-    with st.sidebar:
+    nav_c1, nav_c2, nav_c3, nav_c4 = st.columns([3.8, 1.3, 1.2, 1.3])
+    with nav_c1:
         st.markdown(
             """
-            <div style="padding-bottom: 12px; border-bottom: 1px solid #D9E0E7; margin-bottom: 16px;">
-                <h3 style="color: #17365D; margin-bottom: 2px;">FIR Assistance</h3>
-                <span style="font-size: 0.80rem; color: #5B6573;">Integrated Surveillance & Reporting System</span>
+            <div style="padding-top: 6px;">
+                <span style="font-size: 1.25rem; font-weight: 800; color: #493A2D; letter-spacing: -0.5px;">
+                    ⚖️ FIR Assistance System
+                </span>
+                <span style="font-size: 0.82rem; color: #68745B; margin-left: 8px; font-weight: 500;">
+                    Public Safety Platform
+                </span>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        st.markdown("**Navigation**")
-        if st.button("🏠 Home / Landing Page", use_container_width=True):
-            navigate_to("landing")
+    with nav_c2:
+        if st.button("Track Complaint", use_container_width=True):
+            navigate_to("auth_track")
 
-        if st.button("📝 Start a Complaint (Direct Flow)", use_container_width=True):
-            reset_chat_state()
-            navigate_to("chat")
-
-        if st.button("🔑 Portal Login", use_container_width=True):
-            navigate_to("login")
-
-        # Active role dashboard links
-        user_role = st.session_state.get("user_role")
-        if user_role:
-            st.markdown("---")
-            st.markdown(f"**Current Role:** `{user_role.title()}`")
-            if user_role == "citizen":
-                if st.button("👤 Citizen Dashboard", use_container_width=True):
+    with nav_c3:
+        if not auth_user:
+            if st.button("Sign in", use_container_width=True):
+                navigate_to("auth_login")
+        else:
+            role_title = auth_user["role"].title()
+            if st.button(f"👤 {role_title}", use_container_width=True):
+                role = auth_user["role"]
+                if role == "citizen":
                     navigate_to("citizen_dashboard")
-            elif user_role == "police":
-                if st.button("🛡️ Police Review Portal", use_container_width=True):
+                elif role == "police":
                     navigate_to("police_dashboard")
-            elif user_role == "admin":
-                if st.button("⚙️ Admin Dashboard", use_container_width=True):
+                elif role == "admin":
                     navigate_to("admin_dashboard")
 
-            if st.button("🚪 Sign Out", use_container_width=True):
-                st.session_state["user_role"] = None
+    with nav_c4:
+        if not auth_user:
+            if st.button("Sign up", use_container_width=True):
+                navigate_to("auth_signup")
+        else:
+            if st.button("Sign out", use_container_width=True):
+                st.session_state["auth_user"] = None
                 navigate_to("landing")
 
-        st.markdown("---")
+
+# ==============================================================================
+# 1. LANDING PAGE (Minimal & Editorial Hero)
+# ==============================================================================
+def render_landing_page() -> None:
+    """Renders the minimal, editorial two-column hero landing page."""
+    col_text, col_photo = st.columns([1.1, 0.9], gap="large")
+
+    with col_text:
         st.markdown(
             """
-            <div style="font-size: 0.82rem; color: #5B6573; line-height: 1.4;">
-                <p><strong>Supported Languages:</strong><br>English, മലയാളം, हिन्दी</p>
-                <p><strong>FIR Download Policy:</strong><br>Available only after police review and approval.</p>
-                <hr style="margin: 8px 0; border: none; border-top: 1px solid #D9E0E7;">
-                <p style="font-size: 0.78rem;">
-                    <em>Emergency Note:</em> In immediate life-threatening situations, dial <strong>112</strong>.
+            <div style="padding-top: 36px;">
+                <h1 class="hero-title">Your voice deserves to be heard.</h1>
+                <p class="hero-subtitle">
+                    Get guided assistance to prepare and submit your complaint, step by step.
                 </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+        # Primary prominent CTA in Deep Teal
+        if st.button("Register Your Complaint", type="primary", use_container_width=False):
+            navigate_to("language_select")
 
-# ==============================================================================
-# 1. LANDING PAGE
-# ==============================================================================
-def render_landing_page() -> None:
-    """Renders the comprehensive, user-friendly landing experience."""
+        st.markdown(
+            """
+            <p style="font-size: 0.90rem; color: #6B5B4D; margin-top: 14px; margin-bottom: 0;">
+                You can begin without creating an account.
+            </p>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_photo:
+        # Editorial photograph illustrating accessible public assistance
+        img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "editorial_hero.jpg")
+        if os.path.exists(img_path):
+            st.image(
+                img_path,
+                caption="Accessible public service consultation desk.",
+                use_container_width=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div class="editorial-card" style="text-align: center; padding: 40px 20px;">
+                    <span style="font-size: 2rem;">🏛️</span>
+                    <h3 style="color: #493A2D; margin-top: 8px;">Public Service Support</h3>
+                    <p style="color: #6B5B4D; font-size: 0.92rem;">
+                        Providing guided incident reporting and factual assistance.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
     st.markdown(
         """
-        <div class="hero-banner">
-            <h1 style="color: #17365D; font-size: 2.1rem; margin-bottom: 8px;">
-                Integrated AI Surveillance and FIR Assistance System
-            </h1>
-            <p style="color: #1F2937; font-size: 1.12rem; margin-bottom: 18px; line-height: 1.5;">
-                A next-generation public safety platform that assists citizens in submitting structured, 
-                multilingual complaints and empowers law enforcement personnel with automated 
-                First Information Report (FIR) draft generation.
-            </p>
-            <p style="color: #5B6573; font-size: 0.95rem; margin-bottom: 0;">
-                🌐 Seamlessly communicate in <strong>English</strong>, <strong>Malayalam (മലയാളം)</strong>, 
-                or <strong>Hindi (हिन्दी)</strong>. No immediate account creation required for urgent reporting.
+        <div class="editorial-disclaimer">
+            <strong>Operational Notice:</strong> This platform assists citizens in preparing structured complaint documentation 
+            and aids authorized personnel in review. Documents generated within this system do not constitute legally filed First 
+            Information Reports (FIRs) until reviewed, verified, and officially acted upon by authorized law enforcement personnel.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ==============================================================================
+# 2. CITIZEN COMPLAINT INTAKE WORKFLOW
+# ==============================================================================
+def render_language_select() -> None:
+    """Step 1: Language selection before starting intake conversation."""
+    col_nav, _ = st.columns([1, 4])
+    with col_nav:
+        if st.button("⬅️ Back"):
+            navigate_to("landing")
+
+    st.markdown(
+        """
+        <div class="auth-container" style="text-align: center;">
+            <h2 style="color: #493A2D; margin-top: 0;">Select Your Preferred Language</h2>
+            <p style="color: #6B5B4D; font-size: 0.95rem; margin-bottom: 24px;">
+                Choose the language you feel most comfortable using to explain the incident.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Urgent action cards
-    col_start, col_login = st.columns([1.5, 1])
-    with col_start:
-        st.markdown(
-            """
-            <div class="app-card" style="border-left: 4px solid #17365D;">
-                <h3 style="color: #17365D; margin-top: 0;">Report an Incident Immediately</h3>
-                <p style="color: #5B6573; margin-bottom: 14px;">
-                    Start our conversational complaint assistant right away. Describe what happened in your 
-                    own words without waiting to create an account.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("🚀 Start a Complaint Now", type="primary", use_container_width=True):
-            reset_chat_state()
-            navigate_to("chat")
-
-    with col_login:
-        st.markdown(
-            """
-            <div class="app-card" style="border-left: 4px solid #315B86;">
-                <h3 style="color: #17365D; margin-top: 0;">Portal Access</h3>
-                <p style="color: #5B6573; margin-bottom: 14px;">
-                    Log in as a citizen to track your case, or access authorized portals for police officers 
-                    and system administrators.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        col_l1, col_l2 = st.columns(2)
-        with col_l1:
-            if st.button("🔑 Portal Login", use_container_width=True):
-                navigate_to("login")
-        with col_l2:
-            if st.button("📝 Create Account", use_container_width=True):
-                navigate_to("signup")
-
-    st.markdown("---")
-    st.markdown("### How the System Works")
-    st.markdown(
-        "A clear, 4-step workflow designed to ensure factual accuracy, citizen privacy, and police oversight:"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(
-            """
-            <div class="step-card">
-                <div class="step-number">1</div>
-                <h4 style="color: #17365D; margin-top: 4px;">Conversational Intake</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    Explain what happened naturally. The assistant guides you step-by-step to gather critical details.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col2:
-        st.markdown(
-            """
-            <div class="step-card">
-                <div class="step-number">2</div>
-                <h4 style="color: #17365D; margin-top: 4px;">Fact Verification</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    Inspect the gathered facts on a structured verification screen. You can edit any field before submitting.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col3:
-        st.markdown(
-            """
-            <div class="step-card">
-                <div class="step-number">3</div>
-                <h4 style="color: #17365D; margin-top: 4px;">Police Review</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    Authorized station personnel inspect the complaint and oversee structured Malayalam FIR draft generation.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col4:
-        st.markdown(
-            """
-            <div class="step-card">
-                <div class="step-number">4</div>
-                <h4 style="color: #17365D; margin-top: 4px;">FIR Approval & Download</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    Once reviewed and approved by police officers, the official FIR draft is unlocked for citizen download.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("English\n\n(Standard English)", use_container_width=True):
+            st.session_state["selected_language"] = "en"
+            reset_intake()
+            navigate_to("complaint_chat")
+    with c2:
+        if st.button("മലയാളം\n\n(Malayalam)", use_container_width=True):
+            st.session_state["selected_language"] = "ml"
+            reset_intake()
+            navigate_to("complaint_chat")
+    with c3:
+        if st.button("हिन्दी\n\n(Hindi)", use_container_width=True):
+            st.session_state["selected_language"] = "hi"
+            reset_intake()
+            navigate_to("complaint_chat")
 
 
-# ==============================================================================
-# 2. CONVERSATIONAL COMPLAINT CHAT
-# ==============================================================================
 def render_complaint_chat() -> None:
-    """Renders the conversational complaint reporting interface."""
-    col_nav, col_title = st.columns([1, 4])
+    """Step 2: Full-screen conversational intake assistant with dark legible bubbles and fallback."""
+    col_nav, col_mid, col_fallback = st.columns([1, 3, 2])
     with col_nav:
-        if st.button("⬅️ Home", use_container_width=True):
+        if st.button("⬅️ Home"):
             navigate_to("landing")
-    with col_title:
-        st.subheader("Conversational Incident Reporting")
+    with col_mid:
+        lang_names = {"en": "English", "ml": "മലയാളം (Malayalam)", "hi": "हिन्दी (Hindi)"}
+        curr_lang = st.session_state.get("selected_language", "en")
+        st.markdown(
+            f"<div style='padding-top: 6px; font-size: 0.90rem; color: #6B5B4D;'>Language: <strong>{lang_names.get(curr_lang, 'English')}</strong></div>",
+            unsafe_allow_html=True,
+        )
+    with col_fallback:
+        # Styled as a secondary fallback action
+        if st.button("Guided Form Fallback 📋", help="Switch directly to a structured form while preserving your entered facts"):
+            navigate_to("complaint_guided_form")
 
-    st.caption(
-        "Describe your incident naturally. The assistant will ask follow-up questions to gather necessary facts. "
-        "Supports English, Malayalam (മലയാളം), and Hindi (हिन्दी)."
-    )
-
-    # Step progress tracking
+    lang = st.session_state.get("selected_language", "en")
     step_idx = st.session_state.get("chat_step_index", 0)
     total_steps = len(CHAT_STEPS)
-    progress_val = min(1.0, max(0.0, step_idx / total_steps))
 
-    current_step_name = CHAT_STEPS[step_idx] if step_idx < total_steps else "complete"
-    step_labels = {
-        "description": "Incident Description",
-        "name": "Complainant Name",
-        "contact": "Contact Number",
-        "category": "Incident Category",
-        "date_time": "Incident Date & Time",
-        "location": "Incident Location",
-        "additional_info": "Additional Information",
-        "complete": "Ready for Verification",
-    }
-
-    st.progress(progress_val)
-    st.markdown(
-        f"<span style='font-size: 0.85rem; color: #5B6573;'>Progress: Step {min(step_idx + 1, total_steps)} of {total_steps} — <strong>{step_labels.get(current_step_name, '')}</strong></span>",
-        unsafe_allow_html=True,
-    )
-
-    # Initialize first prompt if chat is fresh
-    messages = st.session_state["chat_messages"]
+    # Initialize welcome message if conversation is clean
+    messages = st.session_state.get("chat_messages", [])
     if not messages:
-        first_prompt = get_step_prompt(CHAT_STEPS[0])
-        messages.append({"role": "assistant", "content": first_prompt})
+        welcome_text = get_step_prompt("welcome", lang)
+        messages.append({"role": "assistant", "content": welcome_text})
+        st.session_state["chat_messages"] = messages
 
-    # Render chat conversation
+    # Render conversation bubbles
     for msg in messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # If all steps are complete, show prompt to proceed to verification
+    # If all steps are complete, provide clear progression
     if step_idx >= total_steps:
-        st.success("✅ All required incident details have been collected!")
-        st.info(
-            "Please proceed to the **Incident Verification** screen to review your information and make any adjustments before confirming submission."
+        st.markdown(
+            """
+            <div class="editorial-card" style="border-left: 4px solid #356B68; margin-top: 14px;">
+                <h4 style="color: #356B68; margin-top: 0;">✅ Incident Details Gathered</h4>
+                <p style="font-size: 0.92rem; color: #493A2D; margin-bottom: 12px;">
+                    All required factual items have been gathered. Please proceed to the verification screen 
+                    to review your facts before final confirmation.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            if st.button("Proceed to Verify Details ➡️", type="primary", use_container_width=True):
-                navigate_to("verify")
-        with col_c2:
-            if st.button("🔄 Restart Conversation", use_container_width=True):
-                reset_chat_state()
-                st.rerun()
+        if st.button("Proceed to Review & Confirm Facts ➡️", type="primary", use_container_width=True):
+            navigate_to("complaint_verify")
         return
 
-    # Category quick-select buttons if at category step
+    current_step_name = CHAT_STEPS[step_idx]
+
+    # Category quick-select buttons if currently on the category step
     if current_step_name == "category":
-        st.markdown("💡 *Quick Select Category:*")
-        cat_cols = st.columns(2)
+        st.markdown("<p style='font-size: 0.90rem; color: #6B5B4D; margin: 8px 0 4px 0;'>Select Category:</p>", unsafe_allow_html=True)
+        cat_c1, cat_c2 = st.columns(2)
         for i, cat in enumerate(SUPPORTED_CATEGORIES):
-            target_col = cat_cols[i % 2]
-            with target_col:
-                if st.button(cat, key=f"quick_cat_{i}", use_container_width=True):
-                    _handle_chat_input(cat)
+            target = cat_c1 if i % 2 == 0 else cat_c2
+            with target:
+                if st.button(cat, key=f"chat_cat_{i}", use_container_width=True):
+                    _handle_chat_turn(cat)
                     st.rerun()
 
-    # User input bar
-    user_input = st.chat_input("Type your response here in English, മലയാളം, or हिन्दी...")
-    if user_input:
-        _handle_chat_input(user_input)
+    # User message composer
+    user_reply = st.chat_input("Type your response here...")
+    if user_reply:
+        _handle_chat_turn(user_reply)
         st.rerun()
 
-    # Conversation control options
-    st.markdown("---")
-    col_rst, col_skip = st.columns([1, 1])
-    with col_rst:
-        if st.button("🔄 Restart Conversation"):
-            reset_chat_state()
-            st.rerun()
-    with col_skip:
-        if current_step_name == "additional_info":
-            if st.button("⏩ Skip Additional Details"):
-                _handle_chat_input("None")
-                st.rerun()
 
-
-def _handle_chat_input(text: str) -> None:
-    """Processes user response in the chat flow."""
+def _handle_chat_turn(text: str) -> None:
+    """Processes conversational response, validates, and updates slots."""
     step_idx = st.session_state["chat_step_index"]
     current_step = CHAT_STEPS[step_idx]
+    lang = st.session_state.get("selected_language", "en")
 
-    # Append user response to messages
+    # Append citizen message
     st.session_state["chat_messages"].append({"role": "user", "content": text})
 
-    # Validate
+    # Validate step input
     is_valid, err_msg, extracted_slots = validate_chat_step_input(current_step, text)
     if not is_valid:
-        # Prompt user again with error
-        reply = f"⚠️ **Please clarify:** {err_msg}"
-        st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
+        err_reply = f"⚠️ {err_msg}"
+        st.session_state["chat_messages"].append({"role": "assistant", "content": err_reply})
     else:
-        # Update slots
         st.session_state["complaint_slots"].update(extracted_slots)
         next_step_idx = step_idx + 1
         st.session_state["chat_step_index"] = next_step_idx
 
         if next_step_idx < len(CHAT_STEPS):
             next_step_name = CHAT_STEPS[next_step_idx]
-            next_prompt = get_step_prompt(next_step_name)
-            st.session_state["chat_messages"].append({"role": "assistant", "content": next_prompt})
+            prompt = get_step_prompt(next_step_name, lang)
+            st.session_state["chat_messages"].append({"role": "assistant", "content": prompt})
         else:
-            final_msg = (
-                "✅ Thank you! All essential details have been collected. "
-                "Please click **'Proceed to Verify Details'** below to inspect and confirm your complaint."
-            )
-            st.session_state["chat_messages"].append({"role": "assistant", "content": final_msg})
+            done_msg = get_step_prompt("completed", lang)
+            st.session_state["chat_messages"].append({"role": "assistant", "content": done_msg})
 
 
 # ==============================================================================
-# 3. INCIDENT VERIFICATION SCREEN
+# 3. GUIDED FORM FALLBACK (Step 3)
 # ==============================================================================
-def render_incident_verification() -> None:
-    """Renders structured review screen before saving complaint as confirmed."""
-    st.subheader("Incident Verification & Review")
+def render_guided_form() -> None:
+    """Renders structured fallback form that preserves any input entered in chat."""
+    col_nav, _ = st.columns([1, 4])
+    with col_nav:
+        if st.button("⬅️ Back to Chat"):
+            navigate_to("complaint_chat")
+
     st.markdown(
-        "Please review the collected information below carefully. "
-        "You can edit any field or confirm to submit your complaint for police review."
+        """
+        <div class="editorial-card">
+            <h3 style="color: #493A2D; margin-top: 0;">Guided Complaint Form (Direct Submission)</h3>
+            <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 0;">
+                Provide the incident details below directly. Information already collected in your conversation 
+                has been preserved.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     slots = st.session_state.get("complaint_slots", {})
-    is_editing = st.session_state.get("is_editing_verification", False)
 
-    if is_editing:
-        st.markdown("#### Edit Incident Details")
-        with st.form("edit_details_form"):
-            new_name = st.text_input("Full Name *", value=slots.get("name", ""))
-            new_contact = st.text_input("Contact Number *", value=slots.get("contact_number", ""))
+    with st.form("guided_complaint_form"):
+        st.markdown("#### 1. Complainant Details")
+        c1, c2 = st.columns(2)
+        with c1:
+            name_val = st.text_input("Full Name *", value=slots.get("name", ""))
+        with c2:
+            phone_val = st.text_input("Contact Phone Number *", value=slots.get("contact_number", ""))
 
+        st.markdown("#### 2. Incident Details")
+        c3, c4 = st.columns(2)
+        with c3:
             curr_cat = slots.get("category", "")
             cat_idx = SUPPORTED_CATEGORIES.index(curr_cat) if curr_cat in SUPPORTED_CATEGORIES else 0
-            new_cat = st.selectbox("Category *", options=SUPPORTED_CATEGORIES, index=cat_idx)
+            cat_val = st.selectbox("Category *", options=SUPPORTED_CATEGORIES, index=cat_idx)
+        with c4:
+            date_val = st.date_input("Date of Incident *", value=date.today(), max_value=date.today())
 
-            new_location = st.text_input("Incident Location *", value=slots.get("location", ""))
-            new_desc = st.text_area("Incident Description *", value=slots.get("description", ""), height=120)
-            new_extra = st.text_area("Additional Information", value=slots.get("additional_info", ""), height=80)
+        loc_val = st.text_input("Incident Location *", value=slots.get("location", ""))
+        desc_val = st.text_area("Detailed Description *", value=slots.get("description", ""), height=140)
+        extra_val = st.text_area("Additional Information (Optional)", value=slots.get("additional_info", ""), height=80)
 
-            saved = st.form_submit_button("Save Corrections", type="primary")
-            if saved:
-                is_valid, errors = validate_complaint_input(
-                    name=new_name,
-                    contact_number=new_contact,
-                    category=new_cat,
-                    incident_date=date.today(),
-                    location=new_location,
-                    description=new_desc,
-                    additional_info=new_extra,
-                )
-                if not is_valid:
-                    st.error("Please resolve errors:")
-                    for f, err in errors.items():
-                        st.write(f"- **{f}**: {err}")
-                else:
-                    slots["name"] = new_name.strip()
-                    slots["contact_number"] = new_contact.strip()
-                    slots["category"] = new_cat
-                    slots["location"] = new_location.strip()
-                    slots["description"] = new_desc.strip()
-                    slots["additional_info"] = new_extra.strip()
-                    st.session_state["complaint_slots"] = slots
-                    st.session_state["is_editing_verification"] = False
-                    st.success("Corrections saved!")
-                    st.rerun()
-
-    # Document-like summary card
-    st.markdown(
-        f"""
-        <div class="app-card">
-            <span class="status-badge badge-pending">Verification Pending Confirmation</span>
-            <span class="status-badge badge-info">Multilingual Record</span>
-            <div style="margin-top: 10px;">
-                <p><strong>Complainant Name:</strong> {slots.get('name', 'N/A')}</p>
-                <p><strong>Contact Number:</strong> {slots.get('contact_number', 'N/A')}</p>
-                <p><strong>Complaint Category:</strong> {slots.get('category', 'N/A')}</p>
-                <p><strong>Incident Date:</strong> {slots.get('incident_date', 'N/A')} {f"({slots.get('incident_time')})" if slots.get('incident_time') else ""}</p>
-                <p><strong>Incident Location:</strong> {slots.get('location', 'N/A')}</p>
-            </div>
-            <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; padding: 12px; border-radius: 4px; margin-top: 12px;">
-                <strong>Incident Description:</strong><br>
-                <p style="white-space: pre-wrap; margin-top: 4px; color: #1F2937;">{slots.get('description', '')}</p>
-            </div>
-            {f'''<div style="margin-top: 10px; font-size: 0.9rem; color: #5B6573;">
-                <strong>Additional Information:</strong> {slots.get('additional_info')}
-            </div>''' if slots.get('additional_info') else ''}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Actions: Confirm, Edit, Cancel
-    col1, col2, col3 = st.columns([1.5, 1, 1])
-    with col1:
-        if st.button("✅ Confirm Details & Submit", type="primary", use_container_width=True):
-            # Validate one last time before saving
-            is_valid, validation_errors = validate_complaint_input(
-                name=slots.get("name", ""),
-                contact_number=slots.get("contact_number", ""),
-                category=slots.get("category", ""),
-                incident_date=date.today(),
-                location=slots.get("location", ""),
-                description=slots.get("description", ""),
-                additional_info=slots.get("additional_info", ""),
+        submitted = st.form_submit_button("Proceed to Review Facts ➡️", type="primary", use_container_width=True)
+        if submitted:
+            is_valid, errors = validate_complaint_input(
+                name=name_val,
+                contact_number=phone_val,
+                category=cat_val,
+                incident_date=date_val,
+                location=loc_val,
+                description=desc_val,
+                additional_info=extra_val,
             )
             if not is_valid:
-                st.error("Cannot confirm complaint. Required fields are missing or invalid:")
-                for field, err in validation_errors.items():
-                    st.write(f"- **{field}**: {err}")
+                st.error("Please correct the following fields:")
+                for k, err in errors.items():
+                    st.write(f"- **{k.title()}**: {err}")
             else:
-                record = create_complaint_record(
-                    name=slots.get("name", ""),
-                    contact_number=slots.get("contact_number", ""),
-                    category=slots.get("category", ""),
-                    incident_date=date.today(),
-                    location=slots.get("location", ""),
-                    description=slots.get("description", ""),
-                    additional_info=slots.get("additional_info", ""),
-                    incident_time=slots.get("incident_time", ""),
-                )
-                st.session_state["complaints"].append(record)
-                st.session_state["last_submission_id"] = record["complaint_id"]
-                reset_chat_state()
-                navigate_to("confirmation")
-
-    with col2:
-        if st.button("✏️ Edit Details", use_container_width=True):
-            st.session_state["is_editing_verification"] = True
-            st.rerun()
-
-    with col3:
-        if st.button("❌ Cancel Complaint", use_container_width=True):
-            reset_chat_state()
-            st.info("Complaint cancelled. No information was saved.")
-            navigate_to("landing")
+                slots["name"] = name_val.strip()
+                slots["contact_number"] = phone_val.strip()
+                slots["category"] = cat_val
+                slots["incident_date"] = date_val.isoformat()
+                slots["location"] = loc_val.strip()
+                slots["description"] = desc_val.strip()
+                slots["additional_info"] = extra_val.strip()
+                st.session_state["complaint_slots"] = slots
+                navigate_to("complaint_verify")
 
 
 # ==============================================================================
-# 4. SUBMISSION CONFIRMATION
+# 4. REVIEW & VERIFICATION SCREEN (Step 4)
 # ==============================================================================
-def render_submission_confirmation() -> None:
-    """Renders the confirmation screen with reference ID and account prompt."""
-    sub_id = st.session_state.get("last_submission_id", "CMP-UNKNOWN")
-
+def render_complaint_verify() -> None:
+    """Renders structured, editable review screen before persisting complaint."""
     st.markdown(
-        f"""
-        <div class="app-card" style="border-left: 4px solid #237A4B;">
-            <h3 style="color: #237A4B; margin-top: 0;">✅ Complaint Submitted Successfully</h3>
-            <p style="font-size: 1.05rem; margin-bottom: 8px;">
-                Your incident report has been logged with Reference ID: <strong>{sub_id}</strong>
-            </p>
-            <span class="status-badge badge-pending">Status: Complaint Submitted — Pending Police Review</span>
-            <p style="color: #5B6573; margin-top: 10px;">
-                Your report has been queued for station inspection. An authorized officer will review 
-                the submitted facts and oversee the generation of the structured Malayalam FIR draft.
+        """
+        <div style="margin-bottom: 16px;">
+            <h2 style="color: #493A2D; margin-bottom: 4px;">Review & Verify Incident Facts</h2>
+            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
+                Please verify that the information below accurately reflects the incident. You can edit any field 
+                before confirming submission.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Important note on FIR download policy
-    st.info(
-        "ℹ️ **FIR Draft & Download Policy:**\n\n"
-        "To ensure legal validity and prevent misinformation, **the official FIR draft download option "
-        "will be unlocked only after police personnel have reviewed and approved this complaint.**"
-    )
+    slots = st.session_state.get("complaint_slots", {})
 
-    st.markdown("---")
-    st.markdown("### Track Your Complaint & Receive Case Updates")
+    with st.form("verify_and_confirm_form"):
+        st.markdown("#### Complainant Particulars")
+        col1, col2 = st.columns(2)
+        with col1:
+            ver_name = st.text_input("Complainant Name *", value=slots.get("name", ""))
+        with col2:
+            ver_contact = st.text_input("Contact Number *", value=slots.get("contact_number", ""))
+
+        st.markdown("#### Incident Particulars")
+        col3, col4 = st.columns(2)
+        with col3:
+            curr_cat = slots.get("category", "")
+            cat_idx = SUPPORTED_CATEGORIES.index(curr_cat) if curr_cat in SUPPORTED_CATEGORIES else 0
+            ver_cat = st.selectbox("Category *", options=SUPPORTED_CATEGORIES, index=cat_idx)
+        with col4:
+            ver_loc = st.text_input("Incident Location *", value=slots.get("location", ""))
+
+        ver_desc = st.text_area("Incident Description *", value=slots.get("description", ""), height=130)
+        ver_extra = st.text_area("Additional Details", value=slots.get("additional_info", ""), height=70)
+
+        c_submit, c_cancel = st.columns([2, 1])
+        with c_submit:
+            confirmed = st.form_submit_button("Confirm & Submit Complaint 🏛️", type="primary", use_container_width=True)
+        with c_cancel:
+            cancelled = st.form_submit_button("Cancel & Discard ❌", use_container_width=True)
+
+    if cancelled:
+        reset_intake()
+        st.info("Complaint discarded. No information was persisted.")
+        navigate_to("landing")
+
+    if confirmed:
+        is_valid, errors = validate_complaint_input(
+            name=ver_name,
+            contact_number=ver_contact,
+            category=ver_cat,
+            incident_date=date.today(),
+            location=ver_loc,
+            description=ver_desc,
+            additional_info=ver_extra,
+        )
+        if not is_valid:
+            st.error("Please correct the following fields before confirming:")
+            for k, err in errors.items():
+                st.write(f"- **{k.title()}**: {err}")
+        else:
+            ml_draft = generate_malayalam_fir_draft(
+                complainant_name=ver_name.strip(),
+                contact_number=ver_contact.strip(),
+                category=ver_cat,
+                incident_date=date.today().isoformat(),
+                incident_location=ver_loc.strip(),
+                description=ver_desc.strip(),
+                additional_info=ver_extra.strip(),
+            )
+
+            auth_user = st.session_state.get("auth_user")
+            user_id = auth_user["id"] if auth_user else None
+
+            success, msg, saved_record = database.save_complaint(
+                complainant_name=ver_name.strip(),
+                contact_number=ver_contact.strip(),
+                category=ver_cat,
+                incident_date=date.today().isoformat(),
+                incident_location=ver_loc.strip(),
+                description=ver_desc.strip(),
+                additional_info=ver_extra.strip(),
+                intake_language=st.session_state.get("selected_language", "en"),
+                citizen_user_id=user_id,
+                draft_content_ml=ml_draft,
+            )
+
+            if success:
+                st.session_state["last_submitted_ref"] = saved_record["reference_no"]
+                st.session_state["last_submitted_id"] = saved_record["id"]
+                reset_intake()
+                navigate_to("complaint_confirmed")
+            else:
+                st.error(f"Persistence error: {msg}")
+
+
+# ==============================================================================
+# 5. SUBMISSION CONFIRMATION & ACCOUNT LINKING (Steps 5 & 6)
+# ==============================================================================
+def render_complaint_confirmed() -> None:
+    """Renders success confirmation screen with unique reference number and account creation invite."""
+    ref_no = st.session_state.get("last_submitted_ref", "CMP-UNKNOWN")
+
     st.markdown(
-        "Creating an account allows you to track review progress, communicate with investigating personnel, "
-        "and download the approved FIR once authorized."
+        f"""
+        <div class="editorial-card" style="border-top: 4px solid #356B68;">
+            <span class="status-pill pill-submitted">COMPLAINT PERSISTED</span>
+            <h2 style="color: #493A2D; margin: 10px 0 6px 0;">Complaint Successfully Submitted</h2>
+            <p style="font-size: 1.05rem; color: #493A2D; margin-bottom: 14px;">
+                Your incident has been securely recorded with Reference Number:
+            </p>
+            <div style="background-color: #F3EBDD; border: 1px dashed #356B68; padding: 14px; border-radius: 4px; font-family: monospace; font-size: 1.35rem; font-weight: 700; color: #356B68; margin-bottom: 14px;">
+                {ref_no}
+            </div>
+            <p style="font-size: 0.90rem; color: #6B5B4D; line-height: 1.45; margin-bottom: 0;">
+                <strong>Important Notice:</strong> This reference identifies your submitted complaint. It does not mean an official FIR 
+                has been registered. An authorized police officer will inspect the facts, verify the Malayalam FIR draft, 
+                and determine formal registration.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("📝 Create Citizen Account", type="primary", use_container_width=True):
-            navigate_to("signup")
-    with col2:
-        if st.button("🔑 Log In to Existing Account", use_container_width=True):
-            navigate_to("login")
-    with col3:
-        if st.button("🏠 Return to Landing Page", use_container_width=True):
-            navigate_to("landing")
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user:
+        st.markdown(
+            """
+            <div class="editorial-card">
+                <h3 style="color: #493A2D; margin-top: 0;">Track Your Complaint & Receive Updates</h3>
+                <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 18px;">
+                    Create a citizen account or sign in now to link this complaint to your profile. 
+                    This enables authorized case tracking, responses to officer questions, and access to approved documents.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("Create Citizen Account 📝", type="primary", use_container_width=True):
+                navigate_to("auth_signup")
+        with c2:
+            if st.button("Sign in to Existing Account 🔑", use_container_width=True):
+                navigate_to("auth_login")
+        with c3:
+            if st.button("Return to Home 🏠", use_container_width=True):
+                navigate_to("landing")
+    else:
+        st.success(f"This complaint is automatically linked to your authenticated account ({auth_user['email']}).")
+        if st.button("Go to Citizen Dashboard 👤", type="primary"):
+            navigate_to("citizen_dashboard")
 
 
 # ==============================================================================
-# 5. LOGIN & ROLE PROTOTYPE ACCESS
+# 6. AUTHENTICATION & SECURE COMPLAINT LINKING (Section 7)
 # ==============================================================================
-def render_login_page() -> None:
-    """Renders login and demonstration role access page."""
-    col_nav, col_title = st.columns([1, 4])
+def render_auth_login() -> None:
+    """Renders focused, professional sign-in screen without exposed credentials."""
+    col_nav, _ = st.columns([1, 4])
     with col_nav:
         if st.button("⬅️ Home"):
             navigate_to("landing")
-    with col_title:
-        st.subheader("System Portal Login")
-
-    st.caption(
-        "Select your intended demonstration role below to access the role-specific dashboard."
-    )
 
     st.markdown(
         """
-        <div class="disclaimer-banner" style="margin-bottom: 20px;">
-            <strong>Demonstration Access Notice:</strong> Real authentication credentials are not required. 
-            Select one of the three profiles below to explore the interface.
-        </div>
+        <div class="auth-container">
+            <h2 style="color: #493A2D; margin-top: 0; margin-bottom: 6px;">Sign in to Your Account</h2>
+            <p style="color: #6B5B4D; font-size: 0.90rem; margin-bottom: 22px;">
+                Enter your registered credentials to access your authorized portal.
+            </p>
         """,
         unsafe_allow_html=True,
     )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown(
-            """
-            <div class="app-card">
-                <h4 style="color: #17365D;">👤 Citizen Portal</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    Track your submitted complaints, view review status updates, and download approved FIR documents.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Log In as Citizen", use_container_width=True):
-            st.session_state["user_role"] = "citizen"
-            navigate_to("citizen_dashboard")
+    with st.form("login_form"):
+        email = st.text_input("Email Address", placeholder="Enter your registered email")
+        password = st.text_input("Password", type="password", placeholder="Enter your password")
 
-    with col2:
-        st.markdown(
-            """
-            <div class="app-card">
-                <h4 style="color: #17365D;">🛡️ Police Officer</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    Inspect incoming citizen complaints, review AI-drafted Malayalam FIRs, and update approval status.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Log In as Police Officer", type="primary", use_container_width=True):
-            st.session_state["user_role"] = "police"
-            navigate_to("police_dashboard")
+        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+        if submitted:
+            success, msg, user = database.authenticate_user(email, password)
+            if success and user:
+                st.session_state["auth_user"] = user
+                role = user["role"]
+                st.success(f"Welcome back, {user['full_name']}!")
+                if role == "citizen":
+                    navigate_to("citizen_dashboard")
+                elif role == "police":
+                    navigate_to("police_dashboard")
+                elif role == "admin":
+                    navigate_to("admin_dashboard")
+            else:
+                st.error(msg)
 
-    with col3:
-        st.markdown(
-            """
-            <div class="app-card">
-                <h4 style="color: #17365D;">⚙️ Administrator</h4>
-                <p style="font-size: 0.88rem; color: #5B6573;">
-                    System health monitoring, audit logs, model telemetry, and surveillance module controls.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Log In as Administrator", use_container_width=True):
-            st.session_state["user_role"] = "admin"
-            navigate_to("admin_dashboard")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Clean registration link
+    c_link1, c_link2 = st.columns([1, 1])
+    with c_link1:
+        if st.button("Don't have an account? Sign up 📝"):
+            navigate_to("auth_signup")
+    with c_link2:
+        if st.button("Need to track by reference? 🔍"):
+            navigate_to("auth_track")
 
 
-# ==============================================================================
-# 6. SIGN UP PLACEHOLDER
-# ==============================================================================
-def render_signup_page() -> None:
-    """Renders citizen account registration placeholder."""
-    col_nav, col_title = st.columns([1, 4])
+def render_auth_signup() -> None:
+    """Renders clean, focused citizen registration screen."""
+    col_nav, _ = st.columns([1, 4])
     with col_nav:
-        if st.button("⬅️ Back"):
+        if st.button("⬅️ Home"):
             navigate_to("landing")
-    with col_title:
-        st.subheader("Create Citizen Account")
 
     st.markdown(
         """
-        <div class="disclaimer-banner">
-            <strong>Prototype Registration:</strong> Account creation enables case tracking and follow-up. 
-            Real personal passwords are not stored.
-        </div>
+        <div class="auth-container">
+            <h2 style="color: #493A2D; margin-top: 0; margin-bottom: 6px;">Create Citizen Account</h2>
+            <p style="color: #6B5B4D; font-size: 0.90rem; margin-bottom: 22px;">
+                Register to track complaints and receive authorized case status updates.
+            </p>
         """,
         unsafe_allow_html=True,
     )
 
     with st.form("signup_form"):
-        st.text_input("Full Name", placeholder="e.g., Rajesh Kumar")
-        st.text_input("Contact Phone Number", placeholder="e.g., +91 98765 43210")
-        st.text_input("Email Address (Optional)", placeholder="e.g., citizen@example.com")
-        st.text_input("Create Password", type="password", placeholder="Enter demo password")
+        full_name = st.text_input("Full Name", placeholder="e.g., Rajesh Kumar")
+        email = st.text_input("Email Address", placeholder="e.g., citizen@example.com")
+        phone = st.text_input("Contact Phone Number", placeholder="e.g., +91 9447123456")
+        password = st.text_input("Create Password", type="password", placeholder="Minimum 6 characters")
 
-        submitted = st.form_submit_button("Complete Registration", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Register Account", type="primary", use_container_width=True)
         if submitted:
-            st.session_state["user_role"] = "citizen"
-            st.success("Account created successfully in demonstration session!")
-            navigate_to("citizen_dashboard")
-
-
-# ==============================================================================
-# 7. CITIZEN DASHBOARD
-# ==============================================================================
-def render_citizen_dashboard() -> None:
-    """Renders citizen dashboard showing submitted complaints and FIR status."""
-    col_out, col_title = st.columns([1, 4])
-    with col_out:
-        if st.button("🚪 Sign Out"):
-            st.session_state["user_role"] = None
-            navigate_to("landing")
-    with col_title:
-        st.subheader("Citizen Case Tracking Dashboard")
-
-    st.caption("Track the status of incidents submitted during this demonstration session.")
-
-    complaints = st.session_state.get("complaints", [])
-    if not complaints:
-        st.info("ℹ️ You have not submitted any complaints in this session yet.")
-        if st.button("🚀 File a New Complaint Now", type="primary"):
-            reset_chat_state()
-            navigate_to("chat")
-        return
-
-    st.markdown(f"#### Your Active Reports ({len(complaints)})")
-    for item in reversed(complaints):
-        with st.expander(f"Reference ID: {item['complaint_id']} — {item['category']}"):
-            st.write(f"**Incident Date:** {item['incident_date']}")
-            st.write(f"**Location:** {item['incident_location']}")
-            st.write("**Submitted Description:**")
-            st.text_area(
-                "Description",
-                value=item["description"],
-                height=80,
-                disabled=True,
-                key=f"cit_desc_{item['complaint_id']}",
+            success, msg, user = database.create_user(
+                email=email,
+                full_name=full_name,
+                password=password,
+                contact_number=phone,
+                role="citizen",
             )
-            st.write(f"**Current Status:** `{item['status']}`")
+            if success and user:
+                st.session_state["auth_user"] = user
 
-            # FIR download locked notice
-            is_approved = item.get("is_approved", False)
-            if not is_approved:
-                st.markdown(
-                    "<span class='status-badge badge-locked'>🔒 FIR Download Locked</span>",
-                    unsafe_allow_html=True,
-                )
-                st.button(
-                    "📥 Download Approved FIR (PDF)",
-                    disabled=True,
-                    key=f"dl_{item['complaint_id']}",
-                    help="FIR draft must be reviewed and approved by police personnel before download is unlocked.",
-                )
-                st.caption("The official FIR draft download will be unlocked once station personnel review and approve the report.")
+                # Link last complaint if phone numbers match
+                last_ref = st.session_state.get("last_submitted_ref")
+                if last_ref:
+                    database.link_complaint_to_citizen(last_ref, phone, user["id"])
+
+                st.success("Account created successfully!")
+                navigate_to("citizen_dashboard")
             else:
-                st.success("✅ This FIR has been approved by station officers.")
-                st.download_button(
-                    "📥 Download Approved FIR (Text/PDF)",
-                    data=f"FIRST INFORMATION REPORT\nReference: {item['complaint_id']}\nDetails: {item['description']}",
-                    file_name=f"FIR_{item['complaint_id']}.txt",
-                    key=f"dl_app_{item['complaint_id']}",
-                )
+                st.error(msg)
 
-    st.markdown("---")
-    if st.button("📝 File Another Complaint", type="primary"):
-        reset_chat_state()
-        navigate_to("chat")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.button("Already have an account? Sign in 🔑"):
+        navigate_to("auth_login")
 
 
-# ==============================================================================
-# 8. POLICE OFFICER DASHBOARD & DRAFT REVIEW
-# ==============================================================================
-def render_police_dashboard() -> None:
-    """Renders police review portal preserving existing draft review workflows."""
-    col_out, col_title = st.columns([1, 4])
-    with col_out:
-        if st.button("🚪 Sign Out"):
-            st.session_state["user_role"] = None
+def render_auth_track() -> None:
+    """Direct complaint tracking screen requiring authentication or reference verification."""
+    col_nav, _ = st.columns([1, 4])
+    with col_nav:
+        if st.button("⬅️ Home"):
             navigate_to("landing")
-    with col_title:
-        st.subheader("Police Review & FIR Drafting Portal")
 
-    st.caption("Authorized station review interface for inspecting citizen reports and FIR drafts.")
+    auth_user = st.session_state.get("auth_user")
+    if auth_user:
+        navigate_to("citizen_dashboard")
+        return
 
     st.markdown(
         """
-        <div class="app-card" style="border-left: 4px solid #17365D;">
-            <h4 style="color: #17365D; margin-top: 0;">ℹ️ Police Review & Draft Management</h4>
-            <p style="color: #5B6573; margin-bottom: 0;">
-                Inspect citizen-submitted reports. In subsequent stages, AI-assisted Malayalam FIR draft generation 
-                will produce structured FIR drafts for each verified report. Reviewing personnel can inspect, 
-                edit, and approve the draft before making it available to the citizen.
+        <div class="editorial-card" style="max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #493A2D; margin-top: 0;">Track Complaint Status</h2>
+            <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 20px;">
+                To protect citizen privacy, confidential case information is not displayed publicly. 
+                Please sign in to your citizen account, or verify ownership with your registered contact number.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    complaints = st.session_state.get("complaints", [])
-    if not complaints:
-        st.info("No citizen complaints have been received in the current session yet.")
+    c_sign, c_link = st.columns(2)
+    with c_sign:
+        st.markdown("#### Option 1: Sign In")
+        st.write("View all your linked complaints in your personal dashboard.")
+        if st.button("Sign in with Password 🔑", type="primary", use_container_width=True):
+            navigate_to("auth_login")
+
+    with c_link:
+        st.markdown("#### Option 2: Verify by Phone")
+        with st.form("lookup_form"):
+            ref_input = st.text_input("Complaint Reference No.", placeholder="e.g., CMP-20261024-XXXX")
+            phone_input = st.text_input("Registered Phone Number", placeholder="e.g., +91 9447123456")
+            checked = st.form_submit_button("Verify & Check Status")
+            if checked:
+                record = database.get_complaint_by_reference(ref_input)
+                if not record:
+                    st.error("Complaint reference number not found.")
+                else:
+                    if database.re_clean_phone(phone_input) != database.re_clean_phone(record["contact_number"]):
+                        st.error("Ownership verification failed: Phone number does not match record.")
+                    else:
+                        st.success("Ownership verified!")
+                        st.markdown(
+                            f"""
+                            <div class="editorial-card">
+                                <h4>Reference: {record['reference_no']}</h4>
+                                <p><strong>Category:</strong> {record['category']}</p>
+                                <p><strong>Date:</strong> {record['incident_date']} | <strong>Location:</strong> {record['incident_location']}</p>
+                                <p><strong>Current Status:</strong> <span class="status-pill pill-review">{record['status']}</span></p>
+                                <p><strong>FIR Status:</strong> <span class="status-pill pill-locked">{record['fir_status']}</span></p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+
+# ==============================================================================
+# 7. CITIZEN DASHBOARD (Section 7)
+# ==============================================================================
+def render_citizen_dashboard() -> None:
+    """Renders citizen personal dashboard showing linked complaints."""
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user or auth_user["role"] != "citizen":
+        st.warning("Please sign in as a citizen to view this dashboard.")
+        if st.button("Go to Sign In"):
+            navigate_to("auth_login")
         return
 
-    st.markdown(f"#### Incident Complaints for Review ({len(complaints)})")
-    for item in reversed(complaints):
-        with st.expander(
-            f"Case {item['complaint_id']} — {item['category']} ({item['incident_date']})"
-        ):
+    st.markdown(
+        f"""
+        <div style="margin-bottom: 20px;">
+            <h2 style="color: #493A2D; margin-bottom: 4px;">Citizen Case Dashboard</h2>
+            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
+                Logged in as <strong>{auth_user['full_name']}</strong> ({auth_user['email']})
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("🔗 Link an Unlinked Complaint by Reference Number"):
+        with st.form("link_form"):
+            l_ref = st.text_input("Complaint Reference No.", placeholder="e.g., CMP-20261024-XXXX")
+            l_phone = st.text_input("Registered Contact Phone", value=auth_user.get("contact_number", ""))
+            if st.form_submit_button("Verify & Link to My Account"):
+                success, msg = database.link_complaint_to_citizen(l_ref, l_phone, auth_user["id"])
+                if success:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    complaints = database.get_complaints_for_citizen(auth_user["id"])
+    if not complaints:
+        st.markdown(
+            """
+            <div class="editorial-card" style="text-align: center; padding: 40px;">
+                <h3 style="color: #493A2D;">No Linked Complaints Found</h3>
+                <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 20px;">
+                    You do not currently have any complaints associated with this account.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Register a New Complaint 🚀", type="primary"):
+            navigate_to("language_select")
+        return
+
+    st.markdown(f"#### Your Registered Cases ({len(complaints)})")
+    for item in complaints:
+        with st.expander(f"Case {item['reference_no']} — {item['category']} ({item['incident_date']})"):
             c1, c2 = st.columns(2)
             with c1:
                 st.write(f"**Complainant:** {item['complainant_name']}")
                 st.write(f"**Contact Number:** {item['contact_number']}")
             with c2:
-                st.write(f"**Incident Location:** {item['incident_location']}")
                 st.write(f"**Incident Date:** {item['incident_date']}")
+                st.write(f"**Incident Location:** {item['incident_location']}")
 
-            st.write("**Citizen Incident Description (Original):**")
-            st.text_area(
-                "Original Description",
-                value=item["description"],
-                height=90,
-                disabled=True,
-                key=f"pol_desc_{item['complaint_id']}",
-            )
-            if item.get("additional_info"):
-                st.write(f"**Additional Details:** {item['additional_info']}")
+            st.write("**Submitted Facts:**")
+            st.text_area("Description", value=item["description"], height=80, disabled=True, key=f"cit_desc_{item['id']}")
 
-            st.write(f"**Current Review Status:** `{item['status']}`")
+            st.write(f"**Current Status:** `{item['status']}`")
+            st.write(f"**FIR Status:** `{item['fir_status']}`")
 
-            # Demonstration review approval
-            col_ap1, col_ap2 = st.columns(2)
-            with col_ap1:
-                if not item.get("is_approved", False):
-                    if st.button(
-                        f"Approve Case {item['complaint_id']} (Demo)",
-                        key=f"btn_app_{item['complaint_id']}",
-                        type="primary",
-                    ):
-                        item["is_approved"] = True
-                        item["status"] = "Approved — FIR Draft Ready"
-                        st.success(f"Case {item['complaint_id']} approved! Citizen can now download the FIR draft.")
-                        st.rerun()
-                else:
-                    st.success("Case Approved by Station Reviewer.")
-            with col_ap2:
-                st.caption("AI FIR drafting model integration scheduled for subsequent project stages.")
-
-
-# ==============================================================================
-# 9. ADMINISTRATOR DASHBOARD
-# ==============================================================================
-def render_admin_dashboard() -> None:
-    """Renders administrative system overview."""
-    col_out, col_title = st.columns([1, 4])
-    with col_out:
-        if st.button("🚪 Sign Out"):
-            st.session_state["user_role"] = None
-            navigate_to("landing")
-    with col_title:
-        st.subheader("System Administration & Telemetry")
-
-    st.caption("Administrative monitoring and module configuration overview.")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Session Complaints", len(st.session_state.get("complaints", [])))
-    with col2:
-        st.metric("Draft Engine Status", "Stage 2 Ready")
-    with col3:
-        st.metric("Surveillance Engine", "Inactive (Future Scope)")
+            # FIR Download policy
+            if not item.get("is_approved"):
+                st.markdown(
+                    "<span class='status-pill pill-locked'>🔒 FIR Download Locked</span>",
+                    unsafe_allow_html=True,
+                )
+                st.button(
+                    "Download Official FIR (PDF)",
+                    disabled=True,
+                    key=f"dl_locked_{item['id']}",
+                    help="The official FIR draft download will be unlocked only after police review and approval.",
+                )
+                st.caption("Official FIR download requires station review and approval.")
+            else:
+                st.markdown(
+                    "<span class='status-pill pill-approved'>✅ FIR Approved by Police</span>",
+                    unsafe_allow_html=True,
+                )
+                draft = database.get_latest_fir_draft(item["id"])
+                draft_content = draft["draft_content_ml"] if draft else "FIR Record"
+                st.download_button(
+                    "📥 Download Approved FIR (Official Document)",
+                    data=draft_content,
+                    file_name=f"Approved_FIR_{item['reference_no']}.txt",
+                    key=f"dl_app_{item['id']}",
+                )
 
     st.markdown("---")
-    st.markdown("#### System Modules Overview")
+    if st.button("Register Another Incident 🚀", type="primary"):
+        navigate_to("language_select")
+
+
+# ==============================================================================
+# 8. POLICE REVIEW PORTAL (Sections 8 & 9)
+# ==============================================================================
+def render_police_dashboard() -> None:
+    """Renders police officer complaint queue and side-by-side FIR review."""
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user or auth_user["role"] != "police":
+        st.warning("Authorized police credentials required to access this portal.")
+        if st.button("Go to Sign In"):
+            navigate_to("auth_login")
+        return
+
+    active_case_id = st.session_state.get("active_police_case_id")
+    if active_case_id:
+        render_police_fir_review(active_case_id, auth_user)
+        return
+
     st.markdown(
         """
-        - **FIR Assistance Module**: Active. Conversational complaint intake, validation, and review management.
-        - **Multilingual Support**: Active. Unicode text processing for English, Malayalam, and Hindi.
-        - **Face Detection & Missing Person Matching**: Future Scope (inactive).
-        - **CCTV Video Ingestion**: Future Scope (inactive).
-        """
+        <div style="margin-bottom: 16px;">
+            <h2 style="color: #493A2D; margin-bottom: 2px;">Police Complaint Queue</h2>
+            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
+                Prioritized queue of citizen complaints awaiting review, fact inspection, and FIR drafting.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    col_search, col_status, col_cat = st.columns([2, 1, 1])
+    with col_search:
+        search_kw = st.text_input("🔍 Search Reference, Name, Location", placeholder="e.g., CMP- or Aluva")
+    with col_status:
+        status_opts = ["All Statuses", "Submitted", "Pending Review", "Under Review", "More Information Required", "Accepted for Further Processing", "Closed"]
+        sel_status = st.selectbox("Status Filter", options=status_opts)
+    with col_cat:
+        cat_opts = ["All Categories"] + SUPPORTED_CATEGORIES
+        sel_cat = st.selectbox("Category Filter", options=cat_opts)
+
+    complaints = database.get_all_complaints_for_police(
+        status_filter=sel_status,
+        category_filter=sel_cat,
+        search_query=search_kw,
+    )
+
+    if not complaints:
+        st.info("No complaint records match the selected queue criteria.")
+        return
+
+    st.markdown(f"**Cases in Queue:** {len(complaints)}")
+    for case in complaints:
+        with st.container():
+            st.markdown(
+                f"""
+                <div class="editorial-card" style="padding: 16px; margin-bottom: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: 700; color: #493A2D; font-size: 1.05rem;">
+                            Case {case['reference_no']} — {case['category']}
+                        </span>
+                        <span>
+                            <span class="status-pill pill-review">{case['status']}</span>
+                            <span class="status-pill pill-locked">{case['fir_status']}</span>
+                        </span>
+                    </div>
+                    <div style="margin-top: 8px; font-size: 0.90rem; color: #493A2D;">
+                        <strong>Complainant:</strong> {case['complainant_name']} ({case['contact_number']}) | 
+                        <strong>Date:</strong> {case['incident_date']} | 
+                        <strong>Location:</strong> {case['incident_location']}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            col_rev, _ = st.columns([1.5, 4])
+            with col_rev:
+                if st.button("Inspect & Review FIR Draft 🔍", key=f"rev_{case['id']}", type="primary"):
+                    st.session_state["active_police_case_id"] = case["id"]
+                    st.rerun()
+
+
+def render_police_fir_review(complaint_id: int, officer_user: Dict[str, Any]) -> None:
+    """Side-by-side review layout (Left: Confirmed facts, Right: Editable Malayalam FIR draft)."""
+    case = database.get_complaint_by_id(complaint_id)
+    if not case:
+        st.error("Case not found.")
+        st.session_state["active_police_case_id"] = None
+        st.rerun()
+        return
+
+    col_back, col_title = st.columns([1, 4])
+    with col_back:
+        if st.button("⬅️ Back to Queue"):
+            st.session_state["active_police_case_id"] = None
+            st.rerun()
+    with col_title:
+        st.subheader(f"Case Review: {case['reference_no']}")
+
+    latest_draft = database.get_latest_fir_draft(complaint_id)
+    current_ml_draft = latest_draft["draft_content_ml"] if latest_draft else generate_malayalam_fir_draft(
+        complainant_name=case["complainant_name"],
+        contact_number=case["contact_number"],
+        category=case["category"],
+        incident_date=case["incident_date"],
+        incident_location=case["incident_location"],
+        description=case["description"],
+        incident_time=case.get("incident_time", ""),
+        additional_info=case.get("additional_info", ""),
+        reference_no=case["reference_no"],
+    )
+
+    col_facts, col_draft = st.columns([1, 1], gap="medium")
+
+    with col_facts:
+        st.markdown(
+            f"""
+            <div class="editorial-card">
+                <h4 style="color: #493A2D; margin-top: 0; border-bottom: 1px solid #E2D7C3; padding-bottom: 8px;">
+                    Left Panel: Confirmed Citizen Facts
+                </h4>
+                <p><strong>Complainant:</strong> {case['complainant_name']}</p>
+                <p><strong>Contact Phone:</strong> {case['contact_number']}</p>
+                <p><strong>Category:</strong> {case['category']}</p>
+                <p><strong>Incident Date & Time:</strong> {case['incident_date']} {f"({case['incident_time']})" if case.get('incident_time') else ""}</p>
+                <p><strong>Incident Location:</strong> {case['incident_location']}</p>
+                <div style="background-color: #F3EBDD; padding: 10px; border-radius: 4px; margin-top: 10px;">
+                    <strong>Citizen Incident Statement (Original):</strong><br>
+                    <p style="white-space: pre-wrap; margin-top: 4px; font-size: 0.92rem; color: #493A2D;">{case['description']}</p>
+                </div>
+                {f"<p style='margin-top: 8px;'><strong>Additional Details:</strong> {case['additional_info']}</p>" if case.get('additional_info') else ""}
+                <hr style="border: none; border-top: 1px solid #E2D7C3; margin: 12px 0;">
+                <p><strong>Case Status:</strong> <span class="status-pill pill-review">{case['status']}</span></p>
+                <p><strong>FIR Status:</strong> <span class="status-pill pill-locked">{case['fir_status']}</span></p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("📜 Case Audit Trail"):
+            logs = database.get_audit_logs(complaint_id=case["id"])
+            for lg in logs:
+                st.caption(f"{lg['timestamp']} — **{lg['action']}** by {lg.get('actor_email', 'System')}: {lg.get('details', '')}")
+
+    with col_draft:
+        st.markdown(
+            """
+            <div class="editorial-card">
+                <h4 style="color: #356B68; margin-top: 0; border-bottom: 1px solid #E2D7C3; padding-bottom: 8px;">
+                    Right Panel: Editable Malayalam FIR Draft
+                </h4>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.form("fir_draft_edit_form"):
+            edited_ml = st.text_area(
+                "Malayalam FIR Draft Content (Unicode)",
+                value=current_ml_draft,
+                height=340,
+                help="Inspect and edit the generated Malayalam FIR draft. Names, dates, and material facts must remain consistent.",
+            )
+            reviewer_note = st.text_input("Reviewer Notes / Justification", placeholder="e.g., Verified statement with station duty officer.")
+
+            c_save, c_return, c_approve = st.columns([1, 1.2, 1.2])
+            with c_save:
+                save_clicked = st.form_submit_button("Save Draft 💾")
+            with c_return:
+                return_clicked = st.form_submit_button("Return for Correction ↩️")
+            with c_approve:
+                approve_clicked = st.form_submit_button("Approve FIR Draft ✅", type="primary")
+
+        if save_clicked:
+            database.update_fir_draft(
+                complaint_id=case["id"],
+                draft_content_ml=edited_ml,
+                reviewer_user_id=officer_user["id"],
+                reviewer_notes=reviewer_note,
+                status="Pending Police Approval",
+            )
+            st.success("Draft edits saved successfully.")
+            st.rerun()
+
+        if return_clicked:
+            if not reviewer_note.strip():
+                st.error("Please provide a reason in Reviewer Notes when returning a complaint for correction.")
+            else:
+                database.return_complaint_for_correction(
+                    complaint_id=case["id"],
+                    officer_user_id=officer_user["id"],
+                    reason=reviewer_note.strip(),
+                )
+                st.warning("Complaint returned for correction.")
+                st.rerun()
+
+        if approve_clicked:
+            database.update_fir_draft(
+                complaint_id=case["id"],
+                draft_content_ml=edited_ml,
+                reviewer_user_id=officer_user["id"],
+                reviewer_notes=reviewer_note,
+                status="Approved",
+            )
+            database.approve_fir_draft(
+                complaint_id=case["id"],
+                officer_user_id=officer_user["id"],
+                officer_notes=reviewer_note if reviewer_note.strip() else "Approved by Station Reviewer",
+            )
+            st.success("FIR draft approved! Citizen download has been unlocked.")
+            st.rerun()
+
 
 # ==============================================================================
-# MAIN ROUTER
+# 9. ADMINISTRATOR DASHBOARD (Section 10)
+# ==============================================================================
+def render_admin_dashboard() -> None:
+    """Renders administrative portal: role management, system telemetry, audit logs."""
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user or auth_user["role"] != "admin":
+        st.warning("Administrator credentials required.")
+        if st.button("Go to Sign In"):
+            navigate_to("auth_login")
+        return
+
+    st.markdown(
+        """
+        <div style="margin-bottom: 16px;">
+            <h2 style="color: #493A2D; margin-bottom: 2px;">Administrator Control & Audit Portal</h2>
+            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
+                User role governance, system telemetry, and centralized audit trail monitoring.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_users, tab_audit, tab_health = st.tabs(["User Role Management", "System Audit Logs", "Module Telemetry"])
+
+    with tab_users:
+        st.markdown("#### User Accounts & Role Assignment")
+        users = database.get_all_users()
+        for u in users:
+            col_u1, col_u2, col_u3 = st.columns([2, 1, 1])
+            with col_u1:
+                st.write(f"**{u['full_name']}** ({u['email']})")
+                st.caption(f"Phone: {u.get('contact_number') or 'N/A'}")
+            with col_u2:
+                st.write(f"Role: `{u['role']}`")
+            with col_u3:
+                if u["id"] != auth_user["id"]:
+                    new_r = st.selectbox(
+                        "Change Role",
+                        options=["citizen", "police", "admin"],
+                        index=["citizen", "police", "admin"].index(u["role"]),
+                        key=f"role_sel_{u['id']}",
+                    )
+                    if st.button("Update Role", key=f"up_r_{u['id']}"):
+                        database.update_user_role(u["id"], new_r, auth_user["id"])
+                        st.success(f"Updated role for {u['email']} to {new_r}.")
+                        st.rerun()
+
+    with tab_audit:
+        st.markdown("#### Centralized Audit Trail")
+        all_logs = database.get_audit_logs(limit=100)
+        for lg in all_logs:
+            ref_badge = f" [Case: {lg['reference_no']}]" if lg.get("reference_no") else ""
+            st.markdown(
+                f"""
+                <div style="background-color: #FFFCF6; border-left: 3px solid #356B68; padding: 8px 12px; margin-bottom: 8px; border-radius: 4px; font-size: 0.88rem;">
+                    <strong>{lg['timestamp']}</strong> — <code>{lg['action']}</code>{ref_badge}<br>
+                    <span style="color: #6B5B4D;">Actor: {lg.get('actor_email', 'System')} ({lg.get('actor_role', 'N/A')})</span><br>
+                    {lg.get('details', '')}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with tab_health:
+        st.markdown("#### Platform Health & Subsystems")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Database Storage", "SQLite Relational (Operational)")
+        with c2:
+            st.metric("Complaint Intake Engine", "Multilingual Chat & Form Fallback (Operational)")
+        with c3:
+            st.metric("Malayalam FIR Engine", "Fact-Faithful Generator (Operational)")
+
+        st.info("Phase 2 (Missing Person Records) and Phase 3 (CCTV Video Processing) are scheduled for subsequent roadmap milestones.")
+
+
+# ==============================================================================
+# MAIN APPLICATION ROUTER
 # ==============================================================================
 def main() -> None:
-    """Main application entry point and screen routing."""
+    """Main application routing controller."""
     st.set_page_config(
         page_title="Integrated AI Surveillance and FIR Assistance System",
         page_icon="⚖️",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
 
     init_session_state()
     apply_custom_styles()
-    render_sidebar()
-    render_header()
+    render_top_navbar()
 
     current_page = st.session_state.get("current_page", "landing")
 
     if current_page == "landing":
         render_landing_page()
-    elif current_page == "chat":
+    elif current_page == "language_select":
+        render_language_select()
+    elif current_page == "complaint_chat":
         render_complaint_chat()
-    elif current_page == "verify":
-        render_incident_verification()
-    elif current_page == "confirmation":
-        render_submission_confirmation()
-    elif current_page == "login":
-        render_login_page()
-    elif current_page == "signup":
-        render_signup_page()
+    elif current_page == "complaint_guided_form":
+        render_guided_form()
+    elif current_page == "complaint_verify":
+        render_complaint_verify()
+    elif current_page == "complaint_confirmed":
+        render_complaint_confirmed()
+    elif current_page == "auth_login":
+        render_auth_login()
+    elif current_page == "auth_signup":
+        render_auth_signup()
+    elif current_page == "auth_track":
+        render_auth_track()
     elif current_page == "citizen_dashboard":
         render_citizen_dashboard()
     elif current_page == "police_dashboard":

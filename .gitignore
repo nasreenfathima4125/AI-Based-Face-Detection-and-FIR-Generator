@@ -21,3 +21,7 @@ htmlcov/
 # IDE configurations
 .idea/
 .vscode/
+
+# SQLite databases
+*.db
+*.sqlite3

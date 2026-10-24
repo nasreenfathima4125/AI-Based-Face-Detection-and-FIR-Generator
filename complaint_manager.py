@@ -1,23 +1,16 @@
 """
 complaint_manager.py
 --------------------
-Complaint data handling and validation module for the
-Integrated AI Surveillance and FIR Assistance System.
+Complaint data handling, multilingual conversational intake,
+and Malayalam FIR draft generation for the Integrated AI Surveillance
+and FIR Assistance System.
 
 Key responsibilities:
 1. Define official supported complaint categories.
-2. Provide transparent, explainable validation rules for:
-   - Complainant name (non-empty, trimmed, supports any Unicode script).
-   - Contact number (allows '+', '-', spaces, '()', 7-15 digits, no fake verification).
-   - Category (must belong to defined supported list).
-   - Incident date (cannot be in future, accepts today or past).
-   - Incident location (non-empty, trimmed, Unicode supported).
-   - Incident description (non-empty, trimmed, preserves English, Malayalam, Hindi).
-   - Optional additional info (optional, normalized whitespace).
-3. Conversational step validation for rule-based chatbot complaint flow.
-4. Prevent duplicate form submissions via submission fingerprinting.
-5. Construct clean complaint records with accurate status:
-   "Complaint Submitted — FIR Draft Not Yet Generated".
+2. Multilingual conversation prompts (English, Malayalam, Hindi).
+3. Field validation rules (name, contact, date, category, location, description).
+4. Deterministic, fact-faithful Malayalam FIR draft generation.
+5. Conversational slot-filling state machine with AI fallback support.
 """
 
 from datetime import date, datetime
@@ -36,7 +29,6 @@ SUPPORTED_CATEGORIES: List[str] = [
     "Other Incident (മറ്റുള്ളവ)",
 ]
 
-# UI Dropdown options starting with placeholder
 CATEGORY_PLACEHOLDER: str = "Select a category..."
 COMPLAINT_CATEGORIES: List[str] = [CATEGORY_PLACEHOLDER] + SUPPORTED_CATEGORIES
 
@@ -52,8 +44,8 @@ CHAT_STEPS: List[str] = [
 ]
 
 
-def create_empty_complaint_slots() -> Dict[str, Any]:
-    """Returns an empty dictionary of slots to populate during the conversation."""
+def create_empty_complaint_slots(lang: str = "en") -> Dict[str, Any]:
+    """Returns an empty dictionary of slots to populate during the intake conversation."""
     return {
         "description": "",
         "name": "",
@@ -63,31 +55,25 @@ def create_empty_complaint_slots() -> Dict[str, Any]:
         "incident_time": "",
         "location": "",
         "additional_info": "",
+        "language": lang,
     }
 
 
 def validate_contact_number(contact_number: str) -> Tuple[bool, str]:
     """
     Validates a contact phone number:
-    - Allows reasonable formatting characters: digits 0-9, leading '+', spaces, '-', '()'.
+    - Allows digits 0-9, leading '+', spaces, '-', '()'.
     - Rejects letters, symbols (like '@', '#', '$'), and blank strings.
-    - Ensures total digit count is between 7 and 15 digits (ITU-T E.164 standard allows up to 15 digits).
-    - Avoids assuming an exact 10-digit number so landlines, local, and international numbers work.
-    - Note: This only checks format plausibility; it does NOT claim ownership or verification.
-
-    Returns:
-        (is_valid, error_message): Tuple of boolean and descriptive error message.
+    - Ensures total digit count is between 7 and 15 digits (ITU-T E.164 standard).
+    - Note: Only checks format plausibility; does NOT claim ownership or verification.
     """
     cleaned = (contact_number or "").strip()
     if not cleaned:
         return False, "Contact number is required."
 
-    # Check for disallowed characters (letters or unauthorized symbols)
-    # Allowed: digits, spaces, '+', '-', '(', ')'
     if re.search(r"[^\d\s\-()+]", cleaned):
         return False, "Contact number contains invalid characters. Only digits, '+', '-', '()', and spaces are allowed."
 
-    # Extract digits only to check length
     digits_only = re.sub(r"\D", "", cleaned)
     if len(digits_only) < 7:
         return False, "Contact number is too short. Please enter a valid number with at least 7 digits."
@@ -102,11 +88,8 @@ def validate_incident_date(incident_date: Union[date, str, None]) -> Tuple[bool,
     Validates the incident date:
     - Rejects None or empty.
     - Accepts date object or ISO-format date string (YYYY-MM-DD).
-    - Strictly rejects future dates (cannot report an incident that has not occurred yet).
+    - Strictly rejects future dates.
     - Accepts today and past dates.
-
-    Returns:
-        (is_valid, error_message): Tuple of boolean and descriptive error message.
     """
     if incident_date is None:
         return False, "Incident date is required."
@@ -143,20 +126,7 @@ def validate_complaint_input(
 ) -> Tuple[bool, Dict[str, str]]:
     """
     Validates all inputs for a citizen complaint submission.
-
-    Rules:
-    1. Complainant Name: Required, non-empty, trimmed, min 2 characters.
-       Supports English, Malayalam, Hindi, and any Unicode characters.
-    2. Contact Number: Required, 7-15 digits, formatting allowed (+, -, (), spaces).
-    3. Category: Must belong to SUPPORTED_CATEGORIES (placeholder/empty rejected).
-    4. Incident Date: Required, today or past date (future dates rejected).
-    5. Incident Location: Required, non-empty, trimmed, min 3 characters.
-    6. Incident Description: Required, non-empty, trimmed, min 10 characters.
-       Exact Unicode text preserved without translation, rewriting, or hallucination.
-    7. Additional Info: Optional. Surrounding whitespace trimmed without penalty.
-
-    Returns:
-        (is_valid, errors): Boolean flag and a dict mapping field name -> error message.
+    Returns (is_valid, errors_dict).
     """
     errors: Dict[str, str] = {}
 
@@ -199,46 +169,54 @@ def validate_complaint_input(
             "Please provide a more detailed incident description (at least 10 characters)."
         )
 
-    # 7. Additional Info is optional - no validation failure if empty
     is_valid = len(errors) == 0
     return is_valid, errors
 
 
-def get_step_prompt(step_name: str) -> str:
-    """Returns the conversational prompt for a given complaint chat step."""
-    prompts = {
-        "description": (
-            "Welcome to the Incident Reporting Assistant. Please describe what happened in your own words.\n\n"
-            "🌐 *You can type in English, Malayalam (മലയാളം), or Hindi (हिन्दी).*"
-        ),
-        "name": (
-            "Thank you for describing the incident. To prepare the complaint record, "
-            "what is your **Full Name**?"
-        ),
-        "contact": (
-            "Please provide a working **Contact Phone Number** where station personnel "
-            "can reach you for verification and case updates (e.g., `+91 98765 43210` or `(0484) 2345678`)."
-        ),
-        "category": (
-            "Please select or specify the **Complaint Category** that best describes this incident.\n\n"
-            "Choose from:\n"
-            + "\n".join([f"- **{cat}**" for cat in SUPPORTED_CATEGORIES])
-        ),
-        "date_time": (
-            "When did this incident take place? Please provide the **Incident Date** (YYYY-MM-DD or 'Today' / 'Yesterday') "
-            "and approximate time if known (e.g., `2026-10-24 around 3:30 PM` or `Today, 5:00 PM`)."
-        ),
-        "location": (
-            "Where did the incident occur? Please specify the **Incident Location** "
-            "(e.g., landmark, street, junction, town or railway station)."
-        ),
-        "additional_info": (
-            "Do you have any **Additional Information** to add (e.g., suspect physical descriptions, "
-            "vehicle registration numbers, stolen item serial numbers, or witness details)?\n\n"
-            "Type your details, or reply **'None'** / **'Skip'** if not applicable."
-        ),
-    }
-    return prompts.get(step_name, "Please provide the required details.")
+# ==============================================================================
+# MULTILINGUAL PROMPTS
+# ==============================================================================
+MULTILINGUAL_PROMPTS = {
+    "en": {
+        "welcome": "Welcome to the Incident Reporting Assistant. Please describe what happened in your own words. You may write in English, Malayalam, or Hindi.",
+        "description": "Please describe the incident in detail (chronological order, what took place, persons involved).",
+        "name": "Thank you for explaining what happened. To proceed, what is your **Full Name**?",
+        "contact": "Please provide your **Contact Phone Number** so investigating personnel can reach you (e.g., `+91 98765 43210`).",
+        "category": "Please select the **Complaint Category** that best describes this incident:",
+        "date_time": "When did this incident occur? Please provide the **Incident Date** (e.g., `Today`, `Yesterday`, or `YYYY-MM-DD`) and approximate time if known.",
+        "location": "Where did the incident take place? Please specify the **Incident Location** (street, junction, landmark, town).",
+        "additional_info": "Do you have any **Additional Information** to add (e.g., vehicle numbers, witnesses, lost property serials)? Type 'None' or click Skip if not applicable.",
+        "completed": "All necessary details have been collected! Please review and verify your facts before final confirmation.",
+    },
+    "ml": {
+        "welcome": "പരാതി രജിസ്ട്രേഷൻ അസിസ്റ്റന്റിലേക്ക് സ്വാഗതം. സംഭവിച്ച കാര്യങ്ങൾ നിങ്ങളുടെ സ്വന്തം വാക്കുകളിൽ വിവരിക്കുക.",
+        "description": "സംഭവം എന്താണെന്ന് വ്യക്തമായി വിവരിക്കുക (നടന്ന കാര്യങ്ങൾ, വ്യക്തികൾ).",
+        "name": "വിവരങ്ങൾക്ക് നന്ദി. പരാതിക്കാരന്റെ **പൂർണ്ണ നാമം (Full Name)** എന്താണ്?",
+        "contact": "ബന്ധപ്പെടാനുള്ള **ഫോൺ നമ്പർ (Contact Number)** നൽകുക (ഉദാ: `+91 9447123456`).",
+        "category": "സംഭവം ഏത് **വിഭാഗത്തിൽ (Complaint Category)** ഉൾപ്പെടുന്നു എന്ന് തിരഞ്ഞെടുക്കുക:",
+        "date_time": "സംഭവം നടന്ന **തീയതിയും ഏകദേശ സമയവും (Date & Time)** വ്യക്തമാക്കുക (ഉദാ: `ഇന്ന് വൈകുന്നേരം 4 മണി` അല്ലെങ്കിൽ `2026-10-24`).",
+        "location": "സംഭവം നടന്ന **സ്ഥലം (Incident Location)** വ്യക്തമാക്കുക (സ്ഥലപ്പേര്, റോഡ്, നഗരം).",
+        "additional_info": "മറ്റെന്തെങ്കിലും **കൂടുതൽ വിവരങ്ങൾ (Additional Info)** ഉണ്ടോ (വാഹന നമ്പർ, സാക്ഷികൾ)? ഇല്ലെങ്കിൽ 'ഇല്ല' എന്ന് ടൈപ്പ് ചെയ്യുക.",
+        "completed": "എല്ലാ പ്രധാന വിവരങ്ങളും ശേഖരിച്ചു കഴിഞ്ഞു! പരാതി സമർപ്പിക്കുന്നതിന് മുൻപായി വിവരങ്ങൾ പരിശോധിച്ച് ഉറപ്പുവരുത്തുക.",
+    },
+    "hi": {
+        "welcome": "शिकायत सहायता प्रणाली में आपका स्वागत है। कृपया घटना का विवरण अपने शब्दों में लिखें।",
+        "description": "कृपया घटना का विस्तृत विवरण दें (क्या हुआ, कौन शामिल था)।",
+        "name": "धन्यवाद। आगे बढ़ने के लिए कृपया अपना **पूरा नाम (Full Name)** बताएं।",
+        "contact": "कृपया अपना **संपर्क फोन नंबर (Contact Number)** प्रदान करें (जैसे `+91 98765 43210`)।",
+        "category": "कृपया इस घटना के लिए उपयुक्त **शिकायत श्रेणी (Category)** चुनें:",
+        "date_time": "यह घटना कब घटी? कृपया **तारीख और अनुमानित समय (Date & Time)** बताएं (जैसे `आज दोपहर 3 बजे` या `YYYY-MM-DD`)।",
+        "location": "घटना किस **स्थान (Location)** पर हुई? कृपया जगह का नाम या पता लिखें।",
+        "additional_info": "क्या आपके पास कोई **अतिरिक्त जानकारी (Additional Details)** है (जैसे वाहन संख्या, गवाह)? यदि नहीं, तो 'कोई नहीं' लिखें।",
+        "completed": "सभी आवश्यक जानकारी दर्ज कर ली गई है! कृपया पुष्टि करने से पहले अपने विवरण की समीक्षा करें।",
+    },
+}
+
+
+def get_step_prompt(step_name: str, lang: str = "en") -> str:
+    """Returns the conversational prompt for a given step in the chosen language."""
+    prompts = MULTILINGUAL_PROMPTS.get(lang, MULTILINGUAL_PROMPTS["en"])
+    return prompts.get(step_name, "Please provide the requested information.")
 
 
 def validate_chat_step_input(
@@ -270,14 +248,12 @@ def validate_chat_step_input(
         return True, "", {"contact_number": cleaned}
 
     elif step_name == "category":
-        # Check direct match or case-insensitive match
         matched_cat = None
         lower_input = cleaned.lower()
         for cat in SUPPORTED_CATEGORIES:
             if lower_input in cat.lower() or cat.lower() in lower_input:
                 matched_cat = cat
                 break
-        # Also check numeric index 1-7
         if not matched_cat and cleaned.isdigit():
             idx = int(cleaned) - 1
             if 0 <= idx < len(SUPPORTED_CATEGORIES):
@@ -295,20 +271,18 @@ def validate_chat_step_input(
         chosen_date = today
         time_part = ""
 
-        if "today" in lower_input or "ഇന്ന്" in lower_input or "आज" in lower_input:
+        if any(w in lower_input for w in ["today", "ഇന്ന്", "आज"]):
             chosen_date = today
-            # extract remainder as time
             remainder = re.sub(r"(today|ഇന്ന്|आज|at|,)", "", lower_input).strip()
             if remainder:
                 time_part = remainder
-        elif "yesterday" in lower_input or "ഇന്നലെ" in lower_input or "कल" in lower_input:
+        elif any(w in lower_input for w in ["yesterday", "ഇന്നലെ", "कल"]):
             from datetime import timedelta
             chosen_date = today - timedelta(days=1)
             remainder = re.sub(r"(yesterday|ഇന്നലെ|कल|at|,)", "", lower_input).strip()
             if remainder:
                 time_part = remainder
         else:
-            # Check for standard YYYY-MM-DD pattern
             date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", cleaned)
             if date_match:
                 try:
@@ -316,12 +290,10 @@ def validate_chat_step_input(
                     if parsed > today:
                         return False, "Incident date cannot be in the future. Please select today or a past date.", {}
                     chosen_date = parsed
-                    # remainder after date
                     time_part = cleaned.replace(date_match.group(1), "").strip(" ,at")
                 except ValueError:
                     return False, "Invalid date format. Please use YYYY-MM-DD or 'Today'.", {}
             else:
-                # If cannot parse exact date, accept today with user text as time
                 time_part = cleaned
 
         return True, "", {
@@ -343,6 +315,57 @@ def validate_chat_step_input(
     return True, "", {}
 
 
+# ==============================================================================
+# MALAYALAM FIR DRAFT GENERATOR
+# ==============================================================================
+def generate_malayalam_fir_draft(
+    complainant_name: str,
+    contact_number: str,
+    category: str,
+    incident_date: str,
+    incident_location: str,
+    description: str,
+    incident_time: str = "",
+    additional_info: str = "",
+    reference_no: str = "CMP-DRAFT",
+) -> str:
+    """
+    Generates a structured, formal Malayalam First Information Report draft
+    strictly from confirmed complainant facts without hallucination or invented sections.
+    """
+    time_str = f"സമയം: {incident_time}" if incident_time else "സമയം: പരാതിയിൽ വ്യക്തമല്ല"
+    extra_str = additional_info if additional_info else "പ്രത്യേക വിവരങ്ങൾ പരാതിയിൽ ഉൾപ്പെടുത്തിയിട്ടില്ല."
+
+    draft_template = f"""പ്രഥമ വിവര വിവരണം (കരട് — ഉദ്യോഗസ്ഥ പരിശോധനയ്ക്ക് വിധേയം)
+FIRST INFORMATION REPORT DRAFT (PENDING POLICE REVIEW)
+റഫറൻസ് നമ്പർ (Reference ID): {reference_no}
+
+1. പരാതിക്കാരൻ്റെ വിവരങ്ങൾ (Complainant Particulars):
+   - പൂർണ്ണ നാമം (Full Name): {complainant_name}
+   - ഫോൺ നമ്പർ (Contact Number): {contact_number}
+
+2. പരാതിയുടെ വിഭാഗം (Incident Category):
+   - വിഭാഗം: {category}
+
+3. സംഭവ സ്ഥലം, തീയതി, സമയം (Occurrence of Offence):
+   - തീയതി (Date of Incident): {incident_date}
+   - {time_str}
+   - സംഭവ സ്ഥലം (Place of Occurrence): {incident_location}
+
+4. കുറ്റകൃത്യ വിവരണം (Detailed Statement of Incident):
+   {description}
+
+5. അധിക വിവരങ്ങൾ / തെളിവുകൾ (Supplementary Facts / Witnesses):
+   {extra_str}
+
+--------------------------------------------------------------------------------
+നിയമപരമായ നിരാകരണം (Operational Notice):
+ഈ രേഖ പരാതിക്കാരൻ നൽകിയ വസ്തുതകളെ ആധാരമാക്കി തയ്യാറാക്കിയ പ്രഥമ വിവര കരട് (Draft) മാത്രമാണ്. 
+അധികാരപ്പെടുത്തിയ പോലീസ് ഉദ്യോഗസ്ഥന്റെ പരിശോധനയ്ക്കും അംഗീകാരത്തിനും ശേഷമേ ഇത് നിയമപരമായ എഫ്.ഐ.ആർ ആയി രജിസ്റ്റർ ചെയ്യപ്പെടുകയുള്ളൂ.
+"""
+    return draft_template.strip()
+
+
 def compute_submission_fingerprint(
     name: str,
     contact_number: str,
@@ -352,10 +375,7 @@ def compute_submission_fingerprint(
     description: str,
     additional_info: str = "",
 ) -> str:
-    """
-    Generates a deterministic hash fingerprint from cleaned complaint fields.
-    Used to detect and prevent accidental duplicate submissions from duplicate form events.
-    """
+    """Generates a deterministic hash fingerprint from cleaned complaint fields."""
     date_str = (
         incident_date.isoformat()
         if isinstance(incident_date, date)
@@ -384,13 +404,7 @@ def create_complaint_record(
     incident_time: str = "",
     custom_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Creates a structured complaint dictionary from validated inputs.
-    - Trims unnecessary leading/trailing whitespace.
-    - Preserves exact Unicode characters for Malayalam, Hindi, and English.
-    - Sets accurate stage status: 'Complaint Submitted — FIR Draft Not Yet Generated'.
-    - Does NOT claim the complaint is an officially registered FIR or that an AI draft exists.
-    """
+    """Creates a structured complaint dictionary for backwards-compatibility."""
     date_val = (
         incident_date.isoformat()
         if isinstance(incident_date, date)
