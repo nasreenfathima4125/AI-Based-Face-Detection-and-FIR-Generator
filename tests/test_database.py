@@ -6,17 +6,22 @@ complaint linking, audit logging, and restart resilience.
 """
 
 from datetime import date
-import os
+import sqlite3
 import unittest
+from unittest.mock import patch
+
+from test_database_support import isolate_database
+
 import database
+from complaint_manager import generate_malayalam_fir_draft
 
 
 class TestDatabaseLayer(unittest.TestCase):
     """Test suite for database persistence and authentication."""
 
     def setUp(self):
-        """Ensure schema is initialized before each test."""
-        database.init_db()
+        """Initialize a fresh, isolated database before each test."""
+        self.database_path = isolate_database(self, database)
 
     def test_seed_users_exist(self):
         """Verify seeded demonstration users exist."""
@@ -60,6 +65,101 @@ class TestDatabaseLayer(unittest.TestCase):
         self.assertIsNotNone(fetched)
         self.assertEqual(fetched["complainant_name"], "Test Complainant")
         self.assertEqual(fetched["status"], "Submitted")
+
+    def test_complaint_persistence_survives_reopening_database(self):
+        """Verify a saved complaint is available after opening a new connection."""
+        success, _, record = database.save_complaint(
+            complainant_name="Fictional Citizen",
+            contact_number="9876543210",
+            category="Theft / Burglary (മോഷണം)",
+            incident_date="Unknown",
+            incident_location="Sample Road",
+            description="A fictional item was taken from a sample location.",
+        )
+        self.assertTrue(success)
+
+        with database.get_db_connection() as connection:
+            row = connection.execute(
+                "SELECT reference_no FROM complaints WHERE id = ?",
+                (record["id"],),
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["reference_no"], record["reference_no"])
+
+    def test_each_complaint_receives_a_unique_reference(self):
+        """Verify separate complaint submissions receive distinct references."""
+        references = set()
+        for name in ("Fictional Citizen One", "Fictional Citizen Two"):
+            success, _, record = database.save_complaint(
+                complainant_name=name,
+                contact_number="9876543210",
+                category="Theft / Burglary (മോഷണം)",
+                incident_date="Unknown",
+                incident_location="Sample Road",
+                description="A fictional item was taken from a sample location.",
+            )
+            self.assertTrue(success)
+            references.add(record["reference_no"])
+
+        self.assertEqual(len(references), 2)
+
+    def test_duplicate_reference_fails_without_saving_second_complaint(self):
+        """Verify the unique database constraint rejects a repeated reference."""
+        with patch.object(
+            database,
+            "generate_reference_number",
+            return_value="CMP-TEST-DUPLICATE",
+        ):
+            database.save_complaint(
+                complainant_name="Fictional Citizen One",
+                contact_number="9876543210",
+                category="Theft / Burglary (മോഷണം)",
+                incident_date="Unknown",
+                incident_location="Sample Road",
+                description="A fictional item was taken from a sample location.",
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                database.save_complaint(
+                    complainant_name="Fictional Citizen Two",
+                    contact_number="9876543211",
+                    category="Theft / Burglary (മോഷണം)",
+                    incident_date="Unknown",
+                    incident_location="Sample Road",
+                    description="A second fictional item was taken from a sample location.",
+                )
+
+        with database.get_db_connection() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM complaints"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_saved_generated_draft_uses_persisted_reference(self):
+        """Ensure the generator's placeholder is replaced with the saved reference."""
+        draft_content = generate_malayalam_fir_draft(
+            complainant_name="Fictional Complainant",
+            contact_number="9876543210",
+            category="Theft / Burglary (മോഷണം)",
+            incident_date="Unknown",
+            incident_location="Fictional Market Road",
+            description="A fictional item was reported missing.",
+        )
+        success, _, record = database.save_complaint(
+            complainant_name="Fictional Complainant",
+            contact_number="9876543210",
+            category="Theft / Burglary (മോഷണം)",
+            incident_date="Unknown",
+            incident_location="Fictional Market Road",
+            description="A fictional item was reported missing.",
+            draft_content_ml=draft_content,
+        )
+
+        self.assertTrue(success)
+        saved_draft = database.get_latest_fir_draft(record["id"])
+        self.assertIsNotNone(saved_draft)
+        self.assertIn(record["reference_no"], saved_draft["draft_content_ml"])
+        self.assertNotIn("CMP-DRAFT", saved_draft["draft_content_ml"])
 
     def test_secure_complaint_linking(self):
         """Verify complaint linking requires phone number match."""

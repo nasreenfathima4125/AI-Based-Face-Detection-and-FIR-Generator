@@ -51,7 +51,7 @@ def create_empty_complaint_slots(lang: str = "en") -> Dict[str, Any]:
         "name": "",
         "contact_number": "",
         "category": "",
-        "incident_date": date.today().isoformat(),
+        "incident_date": "",
         "incident_time": "",
         "location": "",
         "additional_info": "",
@@ -86,8 +86,9 @@ def validate_contact_number(contact_number: str) -> Tuple[bool, str]:
 def validate_incident_date(incident_date: Union[date, str, None]) -> Tuple[bool, str]:
     """
     Validates the incident date:
+    - Accepts an explicit unknown value without substituting today's date.
     - Rejects None or empty.
-    - Accepts date object or ISO-format date string (YYYY-MM-DD).
+    - Accepts date object, ISO-format date string (YYYY-MM-DD), or "Unknown".
     - Strictly rejects future dates.
     - Accepts today and past dates.
     """
@@ -101,6 +102,16 @@ def validate_incident_date(incident_date: Union[date, str, None]) -> Tuple[bool,
         cleaned_str = incident_date.strip()
         if not cleaned_str:
             return False, "Incident date is required."
+        if cleaned_str.casefold() in {
+            "unknown",
+            "not known",
+            "i don't know",
+            "ഇല്ല",
+            "അറിയില്ല",
+            "पता नहीं",
+            "मालूम नहीं",
+        }:
+            return True, ""
         try:
             parsed_date = datetime.strptime(cleaned_str, "%Y-%m-%d").date()
         except ValueError:
@@ -183,7 +194,7 @@ MULTILINGUAL_PROMPTS = {
         "name": "Thank you for explaining what happened. To proceed, what is your **Full Name**?",
         "contact": "Please provide your **Contact Phone Number** so investigating personnel can reach you (e.g., `+91 98765 43210`).",
         "category": "Please select the **Complaint Category** that best describes this incident:",
-        "date_time": "When did this incident occur? Please provide the **Incident Date** (e.g., `Today`, `Yesterday`, or `YYYY-MM-DD`) and approximate time if known.",
+        "date_time": "When did this incident occur? Provide the **Incident Date** (`Today`, `Yesterday`, or `YYYY-MM-DD`) and approximate time if known. If the date is unknown, type `Unknown`.",
         "location": "Where did the incident take place? Please specify the **Incident Location** (street, junction, landmark, town).",
         "additional_info": "Do you have any **Additional Information** to add (e.g., vehicle numbers, witnesses, lost property serials)? Type 'None' or click Skip if not applicable.",
         "completed": "All necessary details have been collected! Please review and verify your facts before final confirmation.",
@@ -194,7 +205,7 @@ MULTILINGUAL_PROMPTS = {
         "name": "വിവരങ്ങൾക്ക് നന്ദി. പരാതിക്കാരന്റെ **പൂർണ്ണ നാമം (Full Name)** എന്താണ്?",
         "contact": "ബന്ധപ്പെടാനുള്ള **ഫോൺ നമ്പർ (Contact Number)** നൽകുക (ഉദാ: `+91 9447123456`).",
         "category": "സംഭവം ഏത് **വിഭാഗത്തിൽ (Complaint Category)** ഉൾപ്പെടുന്നു എന്ന് തിരഞ്ഞെടുക്കുക:",
-        "date_time": "സംഭവം നടന്ന **തീയതിയും ഏകദേശ സമയവും (Date & Time)** വ്യക്തമാക്കുക (ഉദാ: `ഇന്ന് വൈകുന്നേരം 4 മണി` അല്ലെങ്കിൽ `2026-10-24`).",
+        "date_time": "സംഭവം നടന്ന **തീയതിയും ഏകദേശ സമയവും (Date & Time)** വ്യക്തമാക്കുക (ഉദാ: `ഇന്ന് വൈകുന്നേരം 4 മണി` അല്ലെങ്കിൽ `2026-10-24`). തീയതി അറിയില്ലെങ്കിൽ `അറിയില്ല` എന്ന് എഴുതുക.",
         "location": "സംഭവം നടന്ന **സ്ഥലം (Incident Location)** വ്യക്തമാക്കുക (സ്ഥലപ്പേര്, റോഡ്, നഗരം).",
         "additional_info": "മറ്റെന്തെങ്കിലും **കൂടുതൽ വിവരങ്ങൾ (Additional Info)** ഉണ്ടോ (വാഹന നമ്പർ, സാക്ഷികൾ)? ഇല്ലെങ്കിൽ 'ഇല്ല' എന്ന് ടൈപ്പ് ചെയ്യുക.",
         "completed": "എല്ലാ പ്രധാന വിവരങ്ങളും ശേഖരിച്ചു കഴിഞ്ഞു! പരാതി സമർപ്പിക്കുന്നതിന് മുൻപായി വിവരങ്ങൾ പരിശോധിച്ച് ഉറപ്പുവരുത്തുക.",
@@ -205,7 +216,7 @@ MULTILINGUAL_PROMPTS = {
         "name": "धन्यवाद। आगे बढ़ने के लिए कृपया अपना **पूरा नाम (Full Name)** बताएं।",
         "contact": "कृपया अपना **संपर्क फोन नंबर (Contact Number)** प्रदान करें (जैसे `+91 98765 43210`)।",
         "category": "कृपया इस घटना के लिए उपयुक्त **शिकायत श्रेणी (Category)** चुनें:",
-        "date_time": "यह घटना कब घटी? कृपया **तारीख और अनुमानित समय (Date & Time)** बताएं (जैसे `आज दोपहर 3 बजे` या `YYYY-MM-DD`)।",
+        "date_time": "यह घटना कब घटी? कृपया **तारीख और अनुमानित समय (Date & Time)** बताएं (जैसे `आज दोपहर 3 बजे` या `YYYY-MM-DD`)। यदि तारीख अज्ञात है, तो `पता नहीं` लिखें।",
         "location": "घटना किस **स्थान (Location)** पर हुई? कृपया जगह का नाम या पता लिखें।",
         "additional_info": "क्या आपके पास कोई **अतिरिक्त जानकारी (Additional Details)** है (जैसे वाहन संख्या, गवाह)? यदि नहीं, तो 'कोई नहीं' लिखें।",
         "completed": "सभी आवश्यक जानकारी दर्ज कर ली गई है! कृपया पुष्टि करने से पहले अपने विवरण की समीक्षा करें।",
@@ -271,6 +282,16 @@ def validate_chat_step_input(
         chosen_date = today
         time_part = ""
 
+        if lower_input in {
+            "unknown",
+            "not known",
+            "i don't know",
+            "അറിയില്ല",
+            "पता नहीं",
+            "मालूम नहीं",
+        }:
+            return True, "", {"incident_date": "Unknown", "incident_time": ""}
+
         if any(w in lower_input for w in ["today", "ഇന്ന്", "आज"]):
             chosen_date = today
             remainder = re.sub(r"(today|ഇന്ന്|आज|at|,)", "", lower_input).strip()
@@ -294,7 +315,10 @@ def validate_chat_step_input(
                 except ValueError:
                     return False, "Invalid date format. Please use YYYY-MM-DD or 'Today'.", {}
             else:
-                time_part = cleaned
+                return False, (
+                    "Please use a calendar date, 'Today', 'Yesterday', or "
+                    "'Unknown' if the date is not known."
+                ), {}
 
         return True, "", {
             "incident_date": chosen_date.isoformat(),

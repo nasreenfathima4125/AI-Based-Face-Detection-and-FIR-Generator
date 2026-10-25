@@ -38,6 +38,8 @@ from complaint_manager import (
     validate_complaint_input,
     validate_contact_number,
     validate_incident_date,
+    validate_chat_step_input,
+    create_empty_complaint_slots,
     compute_submission_fingerprint,
     create_complaint_record,
 )
@@ -209,6 +211,22 @@ class TestComplaintValidationStage2(unittest.TestCase):
         # Invalid string format is rejected
         is_valid, err = validate_incident_date("invalid-date-format")
         self.assertFalse(is_valid)
+
+    def test_unknown_incident_date_is_explicit_and_not_defaulted(self):
+        """Unknown dates remain unknown instead of silently becoming today."""
+        slots = create_empty_complaint_slots()
+        self.assertEqual(slots["incident_date"], "")
+
+        is_valid, _, updates = validate_chat_step_input("date_time", "Unknown")
+        self.assertTrue(is_valid)
+        self.assertEqual(updates["incident_date"], "Unknown")
+
+        is_valid, _ = validate_incident_date("Unknown")
+        self.assertTrue(is_valid)
+
+        is_valid, _, updates = validate_chat_step_input("date_time", "sometime last week")
+        self.assertFalse(is_valid)
+        self.assertEqual(updates, {})
 
     def test_incident_location_empty_and_whitespace(self):
         """Test rejection of empty, whitespace-only, or overly short locations."""

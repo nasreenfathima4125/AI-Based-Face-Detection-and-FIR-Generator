@@ -1,6 +1,7 @@
+
 """
 app.py
-------
+
 Integrated AI Surveillance and FIR Assistance System
 
 A professional public-service platform for multilingual citizen complaint intake
@@ -13,22 +14,26 @@ Architecture & Design System:
 - Storage: Relational SQLite database (database.py) with full restart persistence.
 - Security: Salted PBKDF2 hashing, phone-matched complaint ownership verification, immutable audit logging.
 - Workflows:
-  1. Minimal, editorial Landing Page (Headline, CTA, Unsplash editorial photograph).
-  2. Language selection -> Focused conversational intake assistant -> Guided form fallback.
-  3. Structured fact verification -> Persistent save & reference number -> Account linking.
-  4. Police Review Workspace: Complaint Queue + Side-by-side fact inspection & Malayalam FIR draft review.
-  5. Citizen Dashboard: Linked complaints with locked FIR download policy until police approval.
+  1. Minimal, editorial Landing Page.
+  2. Language selection -> conversational intake assistant -> guided form fallback.
+  3. Structured fact verification -> persistent save & reference number -> account linking.
+  4. Police Review Workspace: Complaint Queue and Malayalam FIR draft review.
+  5. Citizen Dashboard: Linked complaints with FIR download policy until police approval.
   6. Administrator Portal: Role assignment, audit logs, and module telemetry.
 """
 
 from datetime import date, datetime
-import os
-from typing import List, Dict, Any, Optional
-import streamlit as st
+from html import escape
+import sqlite3
+from textwrap import dedent
+from typing import List, Dict, Any, Optional, Tuple
 
+import streamlit as st
 import database
+import otp_service
+from sms_provider import SmsProviderError, get_sms_provider
+
 from complaint_manager import (
-    SUPPORTED_CATEGORIES,
     COMPLAINT_CATEGORIES,
     CHAT_STEPS,
     create_empty_complaint_slots,
@@ -38,1359 +43,2743 @@ from complaint_manager import (
     generate_malayalam_fir_draft,
 )
 
+_APP_PAGE_OBJECTS: Dict[str, Any] = {}
+
 
 # ==============================================================================
 # SESSION STATE INITIALIZATION
 # ==============================================================================
+
 def init_session_state() -> None:
     """Initializes session state for persistent routing and user sessions."""
     if "current_page" not in st.session_state:
         st.session_state["current_page"] = "landing"
+
     if "auth_user" not in st.session_state:
         st.session_state["auth_user"] = None
+
     if "selected_language" not in st.session_state:
         st.session_state["selected_language"] = "en"
+
     if "complaint_slots" not in st.session_state:
         st.session_state["complaint_slots"] = create_empty_complaint_slots("en")
+
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
+
     if "chat_step_index" not in st.session_state:
         st.session_state["chat_step_index"] = 0
+
     if "last_submitted_ref" not in st.session_state:
         st.session_state["last_submitted_ref"] = None
+
     if "last_submitted_id" not in st.session_state:
         st.session_state["last_submitted_id"] = None
+
+    if "last_submitted_recovery_handle" not in st.session_state:
+        st.session_state["last_submitted_recovery_handle"] = None
+
+    if "complaint_submission_completed" not in st.session_state:
+        st.session_state["complaint_submission_completed"] = False
+
+    if "confirmation_verified_handle" not in st.session_state:
+        st.session_state["confirmation_verified_handle"] = None
+
     if "active_police_case_id" not in st.session_state:
         st.session_state["active_police_case_id"] = None
 
 
 def navigate_to(page: str) -> None:
-    """Safely transitions between pages and triggers a rerun."""
+    """Switches to a registered Streamlit page without clearing app session state."""
     st.session_state["current_page"] = page
-    st.rerun()
+    st.switch_page(_APP_PAGE_OBJECTS[page])
 
 
 def reset_intake() -> None:
     """Resets conversational slots and chat messages."""
+    previous_handle = st.session_state.get("last_submitted_recovery_handle")
+    if previous_handle:
+        database.revoke_recovery_challenge(
+            otp_service.hash_recovery_handle(previous_handle)
+        )
+
     lang = st.session_state.get("selected_language", "en")
     st.session_state["complaint_slots"] = create_empty_complaint_slots(lang)
     st.session_state["chat_messages"] = []
     st.session_state["chat_step_index"] = 0
+    st.session_state["complaint_submission_completed"] = False
+    st.session_state["last_submitted_ref"] = None
+    st.session_state["last_submitted_id"] = None
+    st.session_state["last_submitted_recovery_handle"] = None
+    st.session_state["confirmation_verified_handle"] = None
+    st.session_state.pop("confirmation_otp", None)
+    st.session_state.pop("confirmation_otp_clear_pending", None)
+    st.session_state.pop("confirmation_otp_feedback", None)
+    for key in ("reference", "recovery"):
+        if key in st.query_params:
+            del st.query_params[key]
 
 
 # ==============================================================================
 # DESIGN SYSTEM & GLOBAL CSS
 # ==============================================================================
+
+def _render_html(markup: str) -> None:
+    """Render embedded HTML after removing indentation that Markdown treats as code."""
+    st.markdown(dedent(markup).strip(), unsafe_allow_html=True)
+
+
 def apply_custom_styles() -> None:
-    """
-    Applies strict Warm Beige / Ivory / Dark Espresso / Deep Teal design tokens.
-    Guarantees readable contrast everywhere and eliminates dark-mode bleed-through.
-    """
-    st.markdown(
+    """Apply the warm beige and ivory design system with accessible contrast."""
+    _render_html(
         """
         <style>
-        /* -------------------------------------------------------------
-           1. Global Base Typography & Colors
-           ------------------------------------------------------------- */
-        html, body, [class*="css"], .stApp {
-            background-color: #F3EBDD !important;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, 
-                         "Noto Sans Malayalam", "Noto Sans Devanagari", sans-serif !important;
-            color: #493A2D !important;
+        :root {
+            --beige: #F3EBDD;
+            --ivory: #FFFCF6;
+            --espresso: #493A2D;
+            --teal: #356B68;
+            --teal-hover: #275250;
+            --olive: #68745B;
+            --muted: #6B5B4D;
+            --border: #DED3C1;
+            --red: #A64B43;
         }
-
-        /* Enforce Dark Espresso on all standard textual elements */
-        p, span, div, li, h1, h2, h3, h4, h5, h6, label {
-            color: #493A2D !important;
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+            background: var(--beige) !important;
+            color: var(--espresso) !important;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                "Noto Sans Malayalam", "Noto Sans Devanagari", sans-serif !important;
         }
-
-        /* Secondary text color */
-        .text-secondary, .stCaption, small {
-            color: #6B5B4D !important;
+        [data-testid="stHeader"] { background: transparent !important; }
+        [data-testid="stAppDeployButton"] { display: none !important; }
+        [data-testid="stMainBlockContainer"] {
+            max-width: 1440px;
+            padding-top: 1.5rem;
+            padding-bottom: 3rem;
         }
-
-        /* -------------------------------------------------------------
-           2. Top Navigation Bar
-           ------------------------------------------------------------- */
+        h1, h2, h3, h4, h5, h6, p, li, label,
+        [data-testid="stMarkdownContainer"] { color: var(--espresso); }
+        h1, h2, h3, h4 { letter-spacing: -0.025em; line-height: 1.25; }
+        h1 { font-size: clamp(2rem, 4vw, 3.25rem); }
+        h2 { font-size: clamp(1.5rem, 3vw, 2.1rem); }
+        [data-testid="stCaptionContainer"], .stCaption { color: var(--muted) !important; }
         .top-navbar {
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            padding: 10px 18px;
-            background-color: #FFFCF6;
-            border-bottom: 1px solid #E2D7C3;
+            justify-content: space-between;
+            gap: 16px;
+            background: var(--ivory);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px 20px;
+            margin-bottom: 28px;
+        }
+        .st-key-top-navbar {
+            background: var(--ivory);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 8px 16px;
             margin-bottom: 24px;
-            border-radius: 6px;
         }
-
-        /* -------------------------------------------------------------
-           3. Content Surfaces & Cards
-           ------------------------------------------------------------- */
-        .editorial-card {
-            background-color: #FFFCF6 !important;
-            border: 1px solid #E2D7C3 !important;
-            border-radius: 6px !important;
-            padding: 26px !important;
+        .st-key-top-navbar [data-testid="stHorizontalBlock"] {
+            align-items: center;
+        }
+        .brand-copy strong {
+            display: block;
+            color: var(--espresso);
+            font-size: 1.08rem;
+            font-weight: 750;
+            letter-spacing: -.025em;
+        }
+        .brand-copy span {
+            display: block;
+            color: var(--muted);
+            font-size: .78rem;
+            margin-top: 3px;
+        }
+        .editorial-card, .auth-container {
+            background: var(--ivory) !important;
+            color: var(--espresso) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 10px !important;
+            padding: clamp(18px, 3vw, 30px) !important;
             margin-bottom: 20px !important;
+            box-shadow: 0 2px 8px rgba(73, 58, 45, 0.035);
         }
-
-        .auth-container {
-            max-width: 460px;
-            margin: 20px auto;
-            background-color: #FFFCF6;
-            border: 1px solid #E2D7C3;
-            border-radius: 6px;
-            padding: 32px;
-        }
-
-        /* -------------------------------------------------------------
-           4. Form Controls & Inputs (Ivory background with dark text)
-           ------------------------------------------------------------- */
-        label, [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] span {
-            color: #493A2D !important;
+        .auth-container { max-width: 560px; margin: 24px auto; }
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stWidgetLabel"] span,
+        [data-testid="stWidgetLabel"] label {
+            color: var(--espresso) !important;
             font-weight: 600 !important;
-            font-size: 0.92rem !important;
+            font-size: .93rem !important;
         }
-
-        .stTextInput input, 
-        .stTextArea textarea, 
-        .stSelectbox div[data-baseweb="select"] > div,
-        input[type="text"],
-        input[type="password"],
-        input[type="email"] {
-            background-color: #FFFCF6 !important;
-            color: #493A2D !important;
-            border: 1px solid #D5CCC0 !important;
-            border-radius: 4px !important;
-            font-size: 0.95rem !important;
+        .stTextInput input, .stTextArea textarea, .stNumberInput input,
+        [data-testid="stChatInput"] textarea {
+            background: var(--ivory) !important;
+            color: var(--espresso) !important;
+            border: 1px solid #BFB3A2 !important;
+            border-radius: 7px !important;
+            font-size: .96rem !important;
+            caret-color: var(--teal) !important;
         }
-
-        .stTextInput input:focus, 
-        .stTextArea textarea:focus,
-        .stSelectbox div[data-baseweb="select"] > div:focus-within {
-            border-color: #356B68 !important;
-            box-shadow: 0 0 0 1px #356B68 !important;
-            outline: none !important;
+        .stSelectbox [data-baseweb="select"] > div,
+        .stDateInput input, .stTimeInput input {
+            background: var(--ivory) !important;
+            color: var(--espresso) !important;
+            border-color: #BFB3A2 !important;
+            border-radius: 7px !important;
         }
-
         input::placeholder, textarea::placeholder {
-            color: #8C7B6D !important;
+            color: #756658 !important;
             opacity: 1 !important;
         }
-
-        /* -------------------------------------------------------------
-           5. Buttons (Deep Teal Primary & Ivory Secondary)
-           ------------------------------------------------------------- */
-        /* Primary buttons: Deep Teal */
-        button[data-testid="baseButton-primary"],
-        button[data-testid="stBaseButton-primary"],
-        button[kind="primary"],
-        .stButton > button[kind="primary"],
-        div[data-testid="stFormSubmitButton"] > button[kind="primary"],
-        div[data-testid="stFormSubmitButton"] > button {
-            background-color: #356B68 !important;
-            border: 1px solid #356B68 !important;
-            color: #FFFCF6 !important;
+        .stTextInput input:focus, .stTextArea textarea:focus,
+        .stNumberInput input:focus, .stDateInput input:focus,
+        [data-testid="stChatInput"] textarea:focus {
+            border-color: var(--teal) !important;
+            box-shadow: 0 0 0 2px rgba(53, 107, 104, .16) !important;
+            outline: none !important;
+        }
+        .stButton > button, .stFormSubmitButton > button,
+        [data-testid="stDownloadButton"] > button {
+            min-height: 42px;
+            border-radius: 7px !important;
             font-weight: 600 !important;
-            border-radius: 4px !important;
-            padding: 8px 18px !important;
         }
-
-        button[data-testid="baseButton-primary"] *,
-        button[data-testid="stBaseButton-primary"] *,
-        button[kind="primary"] *,
-        div[data-testid="stFormSubmitButton"] > button * {
-            color: #FFFCF6 !important;
+        .stButton > button:not([kind="primary"]),
+        .stFormSubmitButton > button:not([kind="primary"]),
+        [data-testid="stDownloadButton"] > button {
+            background: var(--ivory) !important;
+            color: var(--espresso) !important;
+            border: 1px solid #CFC3B2 !important;
         }
-
-        button[data-testid="baseButton-primary"]:hover,
-        button[data-testid="stBaseButton-primary"]:hover,
-        button[kind="primary"]:hover,
-        div[data-testid="stFormSubmitButton"] > button:hover {
-            background-color: #275250 !important;
-            border-color: #275250 !important;
-            color: #FFFCF6 !important;
+        .stButton > button:not([kind="primary"]):hover,
+        .stFormSubmitButton > button:not([kind="primary"]):hover,
+        [data-testid="stDownloadButton"] > button:hover {
+            background: #F0E8DA !important;
+            border-color: var(--teal) !important;
         }
-
-        /* Secondary buttons: Ivory surface with espresso text */
-        button[data-testid="baseButton-secondary"],
-        button[data-testid="stBaseButton-secondary"],
-        button[kind="secondary"],
-        .stButton > button {
-            background-color: #FFFCF6 !important;
-            border: 1px solid #D5CCC0 !important;
-            color: #493A2D !important;
-            font-weight: 500 !important;
-            border-radius: 4px !important;
+        .stButton > button[kind="primary"],
+        .stFormSubmitButton > button[kind="primary"] {
+            background: var(--teal) !important;
+            color: var(--ivory) !important;
+            border: 1px solid var(--teal) !important;
         }
-
-        button[data-testid="baseButton-secondary"] *,
-        button[data-testid="stBaseButton-secondary"] *,
-        .stButton > button * {
-            color: #493A2D !important;
+        .stButton > button[kind="primary"]:hover,
+        .stFormSubmitButton > button[kind="primary"]:hover {
+            background: var(--teal-hover) !important;
+            border-color: var(--teal-hover) !important;
         }
-
-        button[data-testid="baseButton-secondary"]:hover,
-        button[data-testid="stBaseButton-secondary"]:hover,
-        .stButton > button:hover {
-            background-color: #F3EBDD !important;
-            border-color: #356B68 !important;
-            color: #356B68 !important;
+        .stButton > button[kind="primary"] [data-testid="stMarkdownContainer"] p,
+        .stFormSubmitButton > button[kind="primary"] [data-testid="stMarkdownContainer"] p {
+            color: var(--ivory) !important;
         }
-
-        /* -------------------------------------------------------------
-           6. Chat Conversation Bubbles & Input
-           ------------------------------------------------------------- */
-        [data-testid="stChatMessage"] {
-            background-color: #FFFCF6 !important;
-            border: 1px solid #E2D7C3 !important;
-            border-radius: 8px !important;
-            padding: 14px 18px !important;
-            margin-bottom: 12px !important;
+        .stButton > button:focus-visible,
+        .stFormSubmitButton > button:focus-visible {
+            outline: 3px solid rgba(53, 107, 104, .45) !important;
+            outline-offset: 2px !important;
         }
-
-        [data-testid="stChatMessage"] * {
-            color: #493A2D !important;
+        button:disabled { opacity: .58 !important; cursor: not-allowed !important; }
+        .st-key-chat-heading,
+        .st-key-chat-controls,
+        .st-key-complaint-chat-history {
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
         }
-
+        .st-key-chat-controls { margin-top: 4px; margin-bottom: 12px; }
+        .st-key-chat-controls [data-testid="stButton"] > button {
+            min-height: 34px;
+            padding: 4px 9px;
+            color: var(--muted) !important;
+            background: transparent !important;
+            border-color: transparent !important;
+            font-size: .86rem;
+        }
+        .st-key-chat-controls [data-testid="stButton"] > button:hover {
+            color: var(--teal) !important;
+            background: rgba(104, 116, 91, .09) !important;
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessage"] {
+            display: flex;
+            justify-content: flex-start;
+            width: 100%;
+            background: transparent !important;
+            border: 0 !important;
+            border-radius: 0 !important;
+            padding: 0 !important;
+            margin: 0 0 16px !important;
+            box-shadow: none !important;
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessageAvatarAssistant"],
+        .st-key-complaint-chat-history [data-testid="stChatMessageAvatarUser"] {
+            display: none !important;
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessageContent"] {
+            flex: 0 1 auto !important;
+            width: fit-content !important;
+            max-width: min(78%, 680px) !important;
+            margin: 0 !important;
+            background: var(--ivory) !important;
+            border: 1px solid rgba(222, 211, 193, .55) !important;
+            border-radius: 4px 18px 18px 18px !important;
+            padding: 12px 16px !important;
+            box-shadow: 0 1px 4px rgba(73, 58, 45, .035);
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+            justify-content: flex-end;
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
+            background: #E6EDE8 !important;
+            border-color: transparent !important;
+            border-radius: 18px 4px 18px 18px !important;
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) [data-testid="stChatMessageContent"]::before {
+            content: "FIR Assistant";
+            display: block;
+            margin-bottom: 5px;
+            color: var(--teal);
+            font-size: .7rem;
+            font-weight: 700;
+            letter-spacing: .025em;
+        }
+        .st-key-complaint-chat-history [data-testid="stChatMessageContent"] p,
+        .st-key-complaint-chat-history [data-testid="stChatMessageContent"] li {
+            color: var(--espresso) !important;
+        }
+        [data-testid="stBottomBlockContainer"] {
+            box-sizing: border-box;
+            width: 100% !important;
+            max-width: 840px !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+            padding: 0 16px 12px !important;
+        }
         [data-testid="stChatInput"] {
-            background-color: #FFFCF6 !important;
-            border: 1px solid #C4B6A3 !important;
-            border-radius: 6px !important;
+            background: var(--ivory) !important;
+            border: 1px solid #CFC4B3 !important;
+            border-radius: 24px !important;
+            padding: 4px 7px !important;
+            box-shadow: 0 3px 14px rgba(73, 58, 45, .07);
         }
-
+        [data-testid="stChatInput"]:focus-within {
+            border-color: var(--teal) !important;
+            box-shadow: 0 0 0 2px rgba(53, 107, 104, .14),
+                0 3px 14px rgba(73, 58, 45, .07) !important;
+        }
         [data-testid="stChatInput"] textarea {
-            background-color: #FFFCF6 !important;
-            color: #493A2D !important;
-            font-size: 0.95rem !important;
+            background: transparent !important;
+            border: 0 !important;
+            border-radius: 20px !important;
+            box-shadow: none !important;
+            padding: 10px 12px !important;
         }
-
-        [data-testid="stChatInput"] textarea::placeholder {
-            color: #8C7B6D !important;
-        }
-
         [data-testid="stChatInput"] button {
-            color: #356B68 !important;
+            min-width: 36px;
+            min-height: 36px;
+            border-radius: 50% !important;
+            color: var(--ivory) !important;
+            background: var(--teal) !important;
         }
-
-        /* -------------------------------------------------------------
-           7. Status Indicators, Callouts & Expanders
-           ------------------------------------------------------------- */
+        [data-testid="stChatInput"] button:disabled {
+            color: #F5F2EA !important;
+            background: #849D99 !important;
+        }
         .status-pill {
             display: inline-block;
-            padding: 4px 10px;
-            border-radius: 4px;
-            font-size: 0.82rem;
-            font-weight: 600;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: .79rem;
+            font-weight: 700;
+            line-height: 1.4;
         }
-        .pill-submitted { background-color: #E6EDE8; color: #68745B !important; border: 1px solid #C4D3C7; }
-        .pill-review { background-color: #F8EFE4; color: #A66E38 !important; border: 1px solid #E8D3BA; }
-        .pill-approved { background-color: #E2ECEB; color: #356B68 !important; border: 1px solid #ADC7C5; }
-        .pill-returned { background-color: #FAECEB; color: #A64B43 !important; border: 1px solid #E4B5B1; }
-        .pill-locked { background-color: #EDE8DE; color: #73695C !important; border: 1px solid #D5CCC0; }
-
-        div[data-testid="stAlert"] {
-            border-radius: 6px !important;
-            padding: 12px 16px !important;
+        .pill-submitted {
+            background: #E6EDE8;
+            color: #405C49 !important;
+            border: 1px solid #C4D3C7;
         }
-
+        .pill-review {
+            background: #F8EFE4;
+            color: #805523 !important;
+            border: 1px solid #E8D3BA;
+        }
+        .pill-approved {
+            background: #E2ECEB;
+            color: #285B58 !important;
+            border: 1px solid #ADC7C5;
+        }
+        .pill-returned {
+            background: #FAECEB;
+            color: #8C3832 !important;
+            border: 1px solid #E4B5B1;
+        }
+        .pill-locked {
+            background: #EDE8DE;
+            color: #62594E !important;
+            border: 1px solid #D5CCC0;
+        }
+        [data-testid="stAlert"] { border-radius: 8px !important; }
         [data-testid="stExpander"] {
-            background-color: #FFFCF6 !important;
-            border: 1px solid #E2D7C3 !important;
-            border-radius: 6px !important;
-            margin-bottom: 12px !important;
+            background: var(--ivory) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 8px !important;
         }
-
         [data-testid="stExpander"] summary {
-            color: #493A2D !important;
+            color: var(--espresso) !important;
             font-weight: 600 !important;
         }
-
-        /* -------------------------------------------------------------
-           8. Editorial Hero Layout
-           ------------------------------------------------------------- */
+        button[role="tab"] { color: var(--espresso) !important; }
+        button[role="tab"][aria-selected="true"] {
+            color: var(--teal) !important;
+            border-bottom-color: var(--teal) !important;
+        }
+        [data-testid="stMetric"] {
+            background: var(--ivory);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricValue"] { color: var(--espresso) !important; }
         .hero-title {
-            font-size: 2.5rem;
-            font-weight: 800;
-            line-height: 1.15;
-            color: #493A2D;
-            margin-bottom: 14px;
-            letter-spacing: -0.5px;
+            font-size: clamp(2.25rem, 4.5vw, 3.5rem);
+            font-weight: 750;
+            line-height: 1.12;
+            letter-spacing: -.04em;
+            color: var(--espresso);
+            margin: 0 0 18px;
         }
-
         .hero-subtitle {
-            font-size: 1.15rem;
-            color: #493A2D;
-            line-height: 1.55;
-            margin-bottom: 24px;
+            font-size: clamp(1.02rem, 1.5vw, 1.2rem);
+            line-height: 1.7;
+            color: var(--muted);
+            margin-bottom: 26px;
+            max-width: 580px;
         }
-
         .editorial-disclaimer {
-            font-size: 0.82rem;
-            color: #6B5B4D;
-            border-top: 1px solid #E2D7C3;
-            padding-top: 16px;
-            margin-top: 40px;
-            line-height: 1.45;
+            font-size: .86rem;
+            color: var(--muted);
+            border-top: 1px solid var(--border);
+            padding-top: 18px;
+            margin-top: 42px;
+            line-height: 1.7;
+        }
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stExpander"] { overflow-wrap: anywhere; }
+        @media (max-width: 768px) {
+            [data-testid="stMainBlockContainer"] { padding: 1rem 1rem 2rem; }
+            .top-navbar { padding: 12px; margin-bottom: 18px; }
+            .st-key-top-navbar { padding: 8px 10px; margin-bottom: 18px; }
+            .editorial-card, .auth-container { padding: 18px !important; }
+            .hero-title { font-size: 2.25rem; }
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stHorizontalBlock"] .brand-copy) {
+                flex-wrap: wrap;
+                gap: 10px 12px;
+            }
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stHorizontalBlock"] .brand-copy) > [data-testid="stColumn"]:first-child {
+                flex: 1 1 100%;
+                width: 100% !important;
+                min-width: 0;
+            }
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stHorizontalBlock"] .brand-copy) > [data-testid="stColumn"]:not(:first-child) {
+                flex: 1 1 40%;
+                width: auto !important;
+                min-width: 0;
+            }
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] > [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] [data-testid="stImage"]) {
+                flex-wrap: nowrap !important;
+                align-items: center;
+            }
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] > [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] [data-testid="stImage"]) > [data-testid="stColumn"]:first-child {
+                flex: 0 0 72px !important;
+                width: 72px !important;
+                min-width: 72px !important;
+            }
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] > [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"] [data-testid="stImage"]) > [data-testid="stColumn"]:last-child {
+                flex: 1 1 0 !important;
+                width: 0 !important;
+                min-width: 0 !important;
+            }
+            .brand-copy strong { font-size: 1rem; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                transition: none !important;
+                scroll-behavior: auto !important;
+            }
         }
         </style>
         """,
-        unsafe_allow_html=True,
     )
 
 
-# ==============================================================================
-# COMPACT TOP NAVIGATION HEADER
-# ==============================================================================
 def render_top_navbar() -> None:
     """Renders the top navigation header with clean public-service actions."""
     auth_user = st.session_state.get("auth_user")
 
-    nav_c1, nav_c2, nav_c3, nav_c4 = st.columns([3.8, 1.3, 1.2, 1.3])
-    with nav_c1:
-        st.markdown(
-            """
-            <div style="padding-top: 6px;">
-                <span style="font-size: 1.25rem; font-weight: 800; color: #493A2D; letter-spacing: -0.5px;">
-                    ⚖️ FIR Assistance System
-                </span>
-                <span style="font-size: 0.82rem; color: #68745B; margin-left: 8px; font-weight: 500;">
-                    Public Safety Platform
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with nav_c2:
-        if st.button("Track Complaint", use_container_width=True):
-            navigate_to("auth_track")
-
-    with nav_c3:
-        if not auth_user:
-            if st.button("Sign in", use_container_width=True):
-                navigate_to("auth_login")
+    with st.container(key="top-navbar"):
+        if auth_user:
+            nav_c1, nav_c2, nav_c3, nav_c4 = st.columns(
+                [5.2, 1.35, 1.15, 1.05],
+                vertical_alignment="center",
+            )
         else:
-            role_title = auth_user["role"].title()
-            if st.button(f"👤 {role_title}", use_container_width=True):
-                role = auth_user["role"]
-                if role == "citizen":
-                    navigate_to("citizen_dashboard")
-                elif role == "police":
-                    navigate_to("police_dashboard")
-                elif role == "admin":
-                    navigate_to("admin_dashboard")
+            nav_c1, nav_c2, nav_c3 = st.columns(
+                [5.2, 1.35, 1.15],
+                vertical_alignment="center",
+            )
 
-    with nav_c4:
-        if not auth_user:
-            if st.button("Sign up", use_container_width=True):
-                navigate_to("auth_signup")
-        else:
-            if st.button("Sign out", use_container_width=True):
-                st.session_state["auth_user"] = None
-                navigate_to("landing")
+        with nav_c1:
+            logo_col, brand_col = st.columns(
+                [1, 5.8],
+                vertical_alignment="center",
+            )
+            with logo_col:
+                st.image("assets/logo.png", width=72)
+            with brand_col:
+                _render_html(
+                    """
+                    <div class="brand-copy">
+                        <strong>FIR Assistance System</strong>
+                        <span>Complaint support, with care</span>
+                    </div>
+                    """,
+                )
+
+        with nav_c2:
+            if st.button(
+                "Track Complaint",
+                type="tertiary",
+                use_container_width=True,
+                key="navbar_track_complaint",
+            ):
+                navigate_to("auth_track")
+
+        with nav_c3:
+            if not auth_user:
+                if st.button(
+                    "Sign in",
+                    type="primary",
+                    use_container_width=True,
+                    key="navbar_sign_in",
+                ):
+                    navigate_to("auth_login")
+            else:
+                role_title = auth_user["role"].title()
+                if st.button(
+                    f"👤 {role_title}",
+                    use_container_width=True,
+                    key="navbar_role_dashboard",
+                ):
+                    role = auth_user["role"]
+                    if role == "citizen":
+                        navigate_to("citizen_dashboard")
+                    elif role == "police":
+                        navigate_to("police_dashboard")
+                    elif role == "admin":
+                        navigate_to("admin_dashboard")
+
+        if auth_user:
+            with nav_c4:
+                if st.button(
+                    "Sign out",
+                    use_container_width=True,
+                    key="navbar_sign_out",
+                ):
+                    st.session_state["auth_user"] = None
+                    navigate_to("landing")
 
 
 # ==============================================================================
-# 1. LANDING PAGE (Minimal & Editorial Hero)
+# LANDING PAGE
 # ==============================================================================
+
 def render_landing_page() -> None:
-    """Renders the minimal, editorial two-column hero landing page."""
-    col_text, col_photo = st.columns([1.1, 0.9], gap="large")
+    """Renders the premium public landing page."""
 
-    with col_text:
-        st.markdown(
+    # Hero section styling
+    _render_html(
+        """
+        <style>
+        .premium-hero {
+            padding: 52px 0 36px;
+            max-width: 610px;
+        }
+
+        .hero-eyebrow {
+            color: #68745B;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            margin-bottom: 22px;
+        }
+
+        .premium-title {
+            color: #493A2D;
+            font-size: clamp(3rem, 5.2vw, 4.65rem);
+            font-weight: 750;
+            line-height: 1.02;
+            letter-spacing: -0.055em;
+            margin: 0;
+        }
+
+        .premium-subtitle {
+            color: #6B5B4D;
+            font-size: 1.05rem;
+            line-height: 1.8;
+            max-width: 490px;
+            margin: 22px 0 30px;
+        }
+
+        .hero-note {
+            color: #6B5B4D;
+            font-size: 0.82rem;
+            line-height: 1.6;
+            margin-top: 12px;
+        }
+
+        .product-stage {
+            position: relative;
+            width: 100%;
+            max-width: 720px;
+            margin: 16px auto 36px;
+            padding: 22px 26px 36px 0;
+            box-sizing: border-box;
+        }
+
+        .product-window {
+            position: relative;
+            z-index: 1;
+            overflow: hidden;
+            border: 1px solid #DED3C1;
+            border-radius: 14px;
+            background: #FFFCF6;
+            box-shadow: 0 24px 64px rgba(73, 58, 45, .14), 0 3px 10px rgba(73, 58, 45, .06);
+        }
+
+        .product-window-bar {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            height: 42px;
+            padding: 0 15px;
+            background: #F1EBDD;
+            border-bottom: 1px solid #DED3C1;
+        }
+
+        .window-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #C9BDAA;
+        }
+
+        .window-address {
+            margin-left: 12px;
+            color: #75695B;
+            font-size: .68rem;
+            letter-spacing: .02em;
+        }
+
+        .product-body {
+            display: grid;
+            grid-template-columns: 150px minmax(0, 1fr);
+            min-height: 365px;
+        }
+
+        .workflow-rail {
+            padding: 24px 16px;
+            background: #F8F4EB;
+            border-right: 1px solid #E8DFD1;
+        }
+
+        .rail-label, .workflow-label {
+            color: #81735F;
+            font-size: .61rem;
+            font-weight: 750;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+        }
+
+        .workflow-step {
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+            margin-top: 22px;
+            color: #75695B;
+        }
+
+        .workflow-step-number {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 25px;
+            height: 25px;
+            border: 1px solid #D8CEBD;
+            border-radius: 50%;
+            color: #68745B;
+            font-size: .67rem;
+            font-weight: 700;
+        }
+
+        .workflow-step.active .workflow-step-number {
+            color: #FFFCF6;
+            border-color: #356B68;
+            background: #356B68;
+        }
+
+        .workflow-step-copy {
+            padding-top: 3px;
+            font-size: .69rem;
+            line-height: 1.45;
+        }
+
+        .workflow-step.active .workflow-step-copy {
+            color: #493A2D;
+            font-weight: 700;
+        }
+
+        .workflow-main {
+            min-width: 0;
+            padding: 24px 23px 20px;
+        }
+
+        .workflow-main-heading {
+            margin: 8px 0 5px;
+            color: #493A2D;
+            font-size: 1.18rem;
+            font-weight: 720;
+            letter-spacing: -.035em;
+        }
+
+        .workflow-main-copy {
+            margin: 0;
+            color: #75695B;
+            font-size: .75rem;
+            line-height: 1.55;
+        }
+
+        .workflow-fields {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 9px;
+            margin-top: 17px;
+        }
+
+        .workflow-field {
+            min-width: 0;
+            padding: 10px 11px;
+            border: 1px solid #E4DACC;
+            border-radius: 7px;
+            background: #FFFCF6;
+        }
+
+        .workflow-field-label {
+            color: #81735F;
+            font-size: .59rem;
+            font-weight: 700;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+
+        .workflow-field-value {
+            margin-top: 5px;
+            color: #493A2D;
+            font-size: .72rem;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
+        .workflow-description {
+            margin-top: 9px;
+            padding: 11px;
+            border: 1px solid #E4DACC;
+            border-radius: 7px;
+            background: #FFFCF6;
+        }
+
+        .workflow-description p {
+            margin: 6px 0 0;
+            color: #75695B;
+            font-size: .68rem;
+            line-height: 1.5;
+        }
+
+        .draft-float {
+            position: absolute;
+            z-index: 2;
+            right: 0;
+            bottom: 0;
+            width: 205px;
+            padding: 15px 16px;
+            border: 1px solid #E5DACA;
+            border-radius: 10px;
+            background: #FFFCF6;
+            box-shadow: 0 12px 32px rgba(73, 58, 45, .13);
+        }
+
+        .draft-float-label {
+            color: #81735F;
+            font-size: .59rem;
+            font-weight: 750;
+            letter-spacing: .1em;
+            text-transform: uppercase;
+        }
+
+        .draft-float-title {
+            margin-top: 7px;
+            color: #493A2D;
+            font-size: .82rem;
+            font-weight: 700;
+        }
+
+        .draft-float-status {
+            display: inline-block;
+            margin-top: 9px;
+            padding: 5px 8px;
+            border-radius: 5px;
+            background: #E8EBDD;
+            color: #566348;
+            font-size: .61rem;
+            font-weight: 700;
+        }
+
+        .draft-float-copy {
+            margin-top: 8px;
+            color: #75695B;
+            font-size: .65rem;
+            line-height: 1.45;
+        }
+
+        .process-section {
+            border-top: 1px solid #DED3C1;
+            border-bottom: 1px solid #DED3C1;
+            padding: 30px 0;
+            margin-top: 30px;
+            margin-bottom: 28px;
+        }
+
+        .process-heading {
+            color: #493A2D;
+            font-size: 1.45rem;
+            font-weight: 700;
+            letter-spacing: -0.035em;
+            margin-bottom: 24px;
+        }
+
+        .process-number {
+            color: #68745B;
+            font-size: 0.76rem;
+            font-weight: 750;
+            letter-spacing: 0.08em;
+            margin-bottom: 10px;
+        }
+
+        .process-title {
+            color: #493A2D;
+            font-size: 0.95rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .process-description {
+            color: #6B5B4D;
+            font-size: 0.84rem;
+            line-height: 1.65;
+        }
+
+        .legal-note {
+            color: #6B5B4D;
+            font-size: 0.78rem;
+            line-height: 1.7;
+            border-left: 2px solid #68745B;
+            padding: 5px 0 5px 14px;
+            margin: 24px 0 10px 0;
+        }
+
+        /* Primary and secondary Streamlit buttons */
+        div.stButton > button[kind="primary"] {
+            background: #356B68;
+            border: 1px solid #356B68;
+            color: #FFFCF6;
+            border-radius: 7px;
+            min-height: 46px;
+            font-weight: 600;
+            transition: background 0.2s ease;
+        }
+
+        div.stButton > button[kind="primary"] [data-testid="stMarkdownContainer"] p {
+            color: #FFFCF6 !important;
+        }
+
+        div.stButton > button[kind="primary"]:hover {
+            background: #275250;
+            border-color: #275250;
+            color: #FFFFFF;
+        }
+
+        div.stButton > button[kind="secondary"] {
+            background: transparent;
+            border: 1px solid #CFC3B2;
+            color: #493A2D;
+            border-radius: 7px;
+            min-height: 46px;
+            font-weight: 550;
+        }
+
+        div.stButton > button[kind="secondary"]:hover {
+            background: #EAE1D2;
+            border-color: #356B68;
+            color: #493A2D;
+        }
+
+        .hero-primary [data-testid="stMarkdownContainer"] p {
+            color: #FFFCF6 !important;
+        }
+
+        @media (max-width: 768px) {
+            [data-testid="stHorizontalBlock"]:has(.premium-hero) {
+                flex-direction: column;
+                gap: 1.5rem;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(.premium-hero) > [data-testid="stColumn"] {
+                width: 100% !important;
+                flex: 1 1 auto;
+                min-width: 0;
+            }
+
+            .premium-hero {
+                padding-top: 28px;
+            }
+
+            .premium-title {
+                font-size: clamp(2.5rem, 10vw, 3.8rem);
+                overflow-wrap: anywhere;
+            }
+
+            .premium-subtitle {
+                overflow-wrap: anywhere;
+            }
+
+            .product-stage {
+                margin-top: 4px;
+                padding: 10px 0 30px;
+                max-width: 100%;
+                overflow-wrap: anywhere;
+            }
+
+            .product-body {
+                grid-template-columns: 1fr;
+            }
+
+            .workflow-rail {
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr;
+                gap: 8px;
+                padding: 14px;
+                border-right: 0;
+                border-bottom: 1px solid #E8DFD1;
+            }
+
+            .rail-label {
+                grid-column: 1 / -1;
+            }
+
+            .workflow-step {
+                gap: 6px;
+                margin-top: 2px;
+            }
+
+            .workflow-step-copy {
+                font-size: .63rem;
+            }
+
+            .workflow-main {
+                padding: 20px 15px;
+            }
+
+            .draft-float {
+                right: 8px;
+                bottom: 0;
+                width: min(205px, calc(100% - 32px));
+            }
+        }
+        </style>
+        """,
+    )
+
+    # Main hero
+    left, right = st.columns([1.08, 0.92], gap="large")
+
+    with left:
+        _render_html(
             """
-            <div style="padding-top: 36px;">
-                <h1 class="hero-title">Your voice deserves to be heard.</h1>
-                <p class="hero-subtitle">
-                    Get guided assistance to prepare and submit your complaint, step by step.
-                </p>
+            <div class="premium-hero">
+                <div class="hero-eyebrow">Complaint support, with care</div>
+                <div class="premium-title">Justice begins<br>with being heard.</div>
+                <div class="premium-subtitle">
+                    Share what happened in your preferred language. Review every
+                    detail before submitting, and keep the Malayalam FIR draft
+                    pending human review.
+                </div>
             </div>
             """,
-            unsafe_allow_html=True,
         )
-
-        # Primary prominent CTA in Deep Teal
-        if st.button("Register Your Complaint", type="primary", use_container_width=False):
+        if st.button(
+            "Report an incident  →",
+            type="primary",
+            use_container_width=True,
+            key="landing_report_incident",
+        ):
+            reset_intake()
             navigate_to("language_select")
 
-        st.markdown(
-            """
-            <p style="font-size: 0.90rem; color: #6B5B4D; margin-top: 14px; margin-bottom: 0;">
-                You can begin without creating an account.
-            </p>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with col_photo:
-        # Editorial photograph illustrating accessible public assistance
-        img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "editorial_hero.jpg")
-        if os.path.exists(img_path):
-            st.image(
-                img_path,
-                caption="Accessible public service consultation desk.",
-                use_container_width=True,
-            )
-        else:
-            st.markdown(
-                """
-                <div class="editorial-card" style="text-align: center; padding: 40px 20px;">
-                    <span style="font-size: 2rem;">🏛️</span>
-                    <h3 style="color: #493A2D; margin-top: 8px;">Public Service Support</h3>
-                    <p style="color: #6B5B4D; font-size: 0.92rem;">
-                        Providing guided incident reporting and factual assistance.
-                    </p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    st.markdown(
-        """
-        <div class="editorial-disclaimer">
-            <strong>Operational Notice:</strong> This platform assists citizens in preparing structured complaint documentation 
-            and aids authorized personnel in review. Documents generated within this system do not constitute legally filed First 
-            Information Reports (FIRs) until reviewed, verified, and officially acted upon by authorized law enforcement personnel.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ==============================================================================
-# 2. CITIZEN COMPLAINT INTAKE WORKFLOW
-# ==============================================================================
-def render_language_select() -> None:
-    """Step 1: Language selection before starting intake conversation."""
-    col_nav, _ = st.columns([1, 4])
-    with col_nav:
-        if st.button("⬅️ Back"):
-            navigate_to("landing")
-
-    st.markdown(
-        """
-        <div class="auth-container" style="text-align: center;">
-            <h2 style="color: #493A2D; margin-top: 0;">Select Your Preferred Language</h2>
-            <p style="color: #6B5B4D; font-size: 0.95rem; margin-bottom: 24px;">
-                Choose the language you feel most comfortable using to explain the incident.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        if st.button("English\n\n(Standard English)", use_container_width=True):
-            st.session_state["selected_language"] = "en"
-            reset_intake()
-            navigate_to("complaint_chat")
-    with c2:
-        if st.button("മലയാളം\n\n(Malayalam)", use_container_width=True):
-            st.session_state["selected_language"] = "ml"
-            reset_intake()
-            navigate_to("complaint_chat")
-    with c3:
-        if st.button("हिन्दी\n\n(Hindi)", use_container_width=True):
-            st.session_state["selected_language"] = "hi"
-            reset_intake()
-            navigate_to("complaint_chat")
-
-
-def render_complaint_chat() -> None:
-    """Step 2: Full-screen conversational intake assistant with dark legible bubbles and fallback."""
-    col_nav, col_mid, col_fallback = st.columns([1, 3, 2])
-    with col_nav:
-        if st.button("⬅️ Home"):
-            navigate_to("landing")
-    with col_mid:
-        lang_names = {"en": "English", "ml": "മലയാളം (Malayalam)", "hi": "हिन्दी (Hindi)"}
-        curr_lang = st.session_state.get("selected_language", "en")
-        st.markdown(
-            f"<div style='padding-top: 6px; font-size: 0.90rem; color: #6B5B4D;'>Language: <strong>{lang_names.get(curr_lang, 'English')}</strong></div>",
-            unsafe_allow_html=True,
-        )
-    with col_fallback:
-        # Styled as a secondary fallback action
-        if st.button("Guided Form Fallback 📋", help="Switch directly to a structured form while preserving your entered facts"):
-            navigate_to("complaint_guided_form")
-
-    lang = st.session_state.get("selected_language", "en")
-    step_idx = st.session_state.get("chat_step_index", 0)
-    total_steps = len(CHAT_STEPS)
-
-    # Initialize welcome message if conversation is clean
-    messages = st.session_state.get("chat_messages", [])
-    if not messages:
-        welcome_text = get_step_prompt("welcome", lang)
-        messages.append({"role": "assistant", "content": welcome_text})
-        st.session_state["chat_messages"] = messages
-
-    # Render conversation bubbles
-    for msg in messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # If all steps are complete, provide clear progression
-    if step_idx >= total_steps:
-        st.markdown(
-            """
-            <div class="editorial-card" style="border-left: 4px solid #356B68; margin-top: 14px;">
-                <h4 style="color: #356B68; margin-top: 0;">✅ Incident Details Gathered</h4>
-                <p style="font-size: 0.92rem; color: #493A2D; margin-bottom: 12px;">
-                    All required factual items have been gathered. Please proceed to the verification screen 
-                    to review your facts before final confirmation.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Proceed to Review & Confirm Facts ➡️", type="primary", use_container_width=True):
-            navigate_to("complaint_verify")
-        return
-
-    current_step_name = CHAT_STEPS[step_idx]
-
-    # Category quick-select buttons if currently on the category step
-    if current_step_name == "category":
-        st.markdown("<p style='font-size: 0.90rem; color: #6B5B4D; margin: 8px 0 4px 0;'>Select Category:</p>", unsafe_allow_html=True)
-        cat_c1, cat_c2 = st.columns(2)
-        for i, cat in enumerate(SUPPORTED_CATEGORIES):
-            target = cat_c1 if i % 2 == 0 else cat_c2
-            with target:
-                if st.button(cat, key=f"chat_cat_{i}", use_container_width=True):
-                    _handle_chat_turn(cat)
-                    st.rerun()
-
-    # User message composer
-    user_reply = st.chat_input("Type your response here...")
-    if user_reply:
-        _handle_chat_turn(user_reply)
-        st.rerun()
-
-
-def _handle_chat_turn(text: str) -> None:
-    """Processes conversational response, validates, and updates slots."""
-    step_idx = st.session_state["chat_step_index"]
-    current_step = CHAT_STEPS[step_idx]
-    lang = st.session_state.get("selected_language", "en")
-
-    # Append citizen message
-    st.session_state["chat_messages"].append({"role": "user", "content": text})
-
-    # Validate step input
-    is_valid, err_msg, extracted_slots = validate_chat_step_input(current_step, text)
-    if not is_valid:
-        err_reply = f"⚠️ {err_msg}"
-        st.session_state["chat_messages"].append({"role": "assistant", "content": err_reply})
-    else:
-        st.session_state["complaint_slots"].update(extracted_slots)
-        next_step_idx = step_idx + 1
-        st.session_state["chat_step_index"] = next_step_idx
-
-        if next_step_idx < len(CHAT_STEPS):
-            next_step_name = CHAT_STEPS[next_step_idx]
-            prompt = get_step_prompt(next_step_name, lang)
-            st.session_state["chat_messages"].append({"role": "assistant", "content": prompt})
-        else:
-            done_msg = get_step_prompt("completed", lang)
-            st.session_state["chat_messages"].append({"role": "assistant", "content": done_msg})
-
-
-# ==============================================================================
-# 3. GUIDED FORM FALLBACK (Step 3)
-# ==============================================================================
-def render_guided_form() -> None:
-    """Renders structured fallback form that preserves any input entered in chat."""
-    col_nav, _ = st.columns([1, 4])
-    with col_nav:
-        if st.button("⬅️ Back to Chat"):
-            navigate_to("complaint_chat")
-
-    st.markdown(
-        """
-        <div class="editorial-card">
-            <h3 style="color: #493A2D; margin-top: 0;">Guided Complaint Form (Direct Submission)</h3>
-            <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 0;">
-                Provide the incident details below directly. Information already collected in your conversation 
-                has been preserved.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    slots = st.session_state.get("complaint_slots", {})
-
-    with st.form("guided_complaint_form"):
-        st.markdown("#### 1. Complainant Details")
-        c1, c2 = st.columns(2)
-        with c1:
-            name_val = st.text_input("Full Name *", value=slots.get("name", ""))
-        with c2:
-            phone_val = st.text_input("Contact Phone Number *", value=slots.get("contact_number", ""))
-
-        st.markdown("#### 2. Incident Details")
-        c3, c4 = st.columns(2)
-        with c3:
-            curr_cat = slots.get("category", "")
-            cat_idx = SUPPORTED_CATEGORIES.index(curr_cat) if curr_cat in SUPPORTED_CATEGORIES else 0
-            cat_val = st.selectbox("Category *", options=SUPPORTED_CATEGORIES, index=cat_idx)
-        with c4:
-            date_val = st.date_input("Date of Incident *", value=date.today(), max_value=date.today())
-
-        loc_val = st.text_input("Incident Location *", value=slots.get("location", ""))
-        desc_val = st.text_area("Detailed Description *", value=slots.get("description", ""), height=140)
-        extra_val = st.text_area("Additional Information (Optional)", value=slots.get("additional_info", ""), height=80)
-
-        submitted = st.form_submit_button("Proceed to Review Facts ➡️", type="primary", use_container_width=True)
-        if submitted:
-            is_valid, errors = validate_complaint_input(
-                name=name_val,
-                contact_number=phone_val,
-                category=cat_val,
-                incident_date=date_val,
-                location=loc_val,
-                description=desc_val,
-                additional_info=extra_val,
-            )
-            if not is_valid:
-                st.error("Please correct the following fields:")
-                for k, err in errors.items():
-                    st.write(f"- **{k.title()}**: {err}")
-            else:
-                slots["name"] = name_val.strip()
-                slots["contact_number"] = phone_val.strip()
-                slots["category"] = cat_val
-                slots["incident_date"] = date_val.isoformat()
-                slots["location"] = loc_val.strip()
-                slots["description"] = desc_val.strip()
-                slots["additional_info"] = extra_val.strip()
-                st.session_state["complaint_slots"] = slots
-                navigate_to("complaint_verify")
-
-
-# ==============================================================================
-# 4. REVIEW & VERIFICATION SCREEN (Step 4)
-# ==============================================================================
-def render_complaint_verify() -> None:
-    """Renders structured, editable review screen before persisting complaint."""
-    st.markdown(
-        """
-        <div style="margin-bottom: 16px;">
-            <h2 style="color: #493A2D; margin-bottom: 4px;">Review & Verify Incident Facts</h2>
-            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
-                Please verify that the information below accurately reflects the incident. You can edit any field 
-                before confirming submission.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    slots = st.session_state.get("complaint_slots", {})
-
-    with st.form("verify_and_confirm_form"):
-        st.markdown("#### Complainant Particulars")
-        col1, col2 = st.columns(2)
-        with col1:
-            ver_name = st.text_input("Complainant Name *", value=slots.get("name", ""))
-        with col2:
-            ver_contact = st.text_input("Contact Number *", value=slots.get("contact_number", ""))
-
-        st.markdown("#### Incident Particulars")
-        col3, col4 = st.columns(2)
-        with col3:
-            curr_cat = slots.get("category", "")
-            cat_idx = SUPPORTED_CATEGORIES.index(curr_cat) if curr_cat in SUPPORTED_CATEGORIES else 0
-            ver_cat = st.selectbox("Category *", options=SUPPORTED_CATEGORIES, index=cat_idx)
-        with col4:
-            ver_loc = st.text_input("Incident Location *", value=slots.get("location", ""))
-
-        ver_desc = st.text_area("Incident Description *", value=slots.get("description", ""), height=130)
-        ver_extra = st.text_area("Additional Details", value=slots.get("additional_info", ""), height=70)
-
-        c_submit, c_cancel = st.columns([2, 1])
-        with c_submit:
-            confirmed = st.form_submit_button("Confirm & Submit Complaint 🏛️", type="primary", use_container_width=True)
-        with c_cancel:
-            cancelled = st.form_submit_button("Cancel & Discard ❌", use_container_width=True)
-
-    if cancelled:
-        reset_intake()
-        st.info("Complaint discarded. No information was persisted.")
-        navigate_to("landing")
-
-    if confirmed:
-        is_valid, errors = validate_complaint_input(
-            name=ver_name,
-            contact_number=ver_contact,
-            category=ver_cat,
-            incident_date=date.today(),
-            location=ver_loc,
-            description=ver_desc,
-            additional_info=ver_extra,
-        )
-        if not is_valid:
-            st.error("Please correct the following fields before confirming:")
-            for k, err in errors.items():
-                st.write(f"- **{k.title()}**: {err}")
-        else:
-            ml_draft = generate_malayalam_fir_draft(
-                complainant_name=ver_name.strip(),
-                contact_number=ver_contact.strip(),
-                category=ver_cat,
-                incident_date=date.today().isoformat(),
-                incident_location=ver_loc.strip(),
-                description=ver_desc.strip(),
-                additional_info=ver_extra.strip(),
-            )
-
-            auth_user = st.session_state.get("auth_user")
-            user_id = auth_user["id"] if auth_user else None
-
-            success, msg, saved_record = database.save_complaint(
-                complainant_name=ver_name.strip(),
-                contact_number=ver_contact.strip(),
-                category=ver_cat,
-                incident_date=date.today().isoformat(),
-                incident_location=ver_loc.strip(),
-                description=ver_desc.strip(),
-                additional_info=ver_extra.strip(),
-                intake_language=st.session_state.get("selected_language", "en"),
-                citizen_user_id=user_id,
-                draft_content_ml=ml_draft,
-            )
-
-            if success:
-                st.session_state["last_submitted_ref"] = saved_record["reference_no"]
-                st.session_state["last_submitted_id"] = saved_record["id"]
-                reset_intake()
-                navigate_to("complaint_confirmed")
-            else:
-                st.error(f"Persistence error: {msg}")
-
-
-# ==============================================================================
-# 5. SUBMISSION CONFIRMATION & ACCOUNT LINKING (Steps 5 & 6)
-# ==============================================================================
-def render_complaint_confirmed() -> None:
-    """Renders success confirmation screen with unique reference number and account creation invite."""
-    ref_no = st.session_state.get("last_submitted_ref", "CMP-UNKNOWN")
-
-    st.markdown(
-        f"""
-        <div class="editorial-card" style="border-top: 4px solid #356B68;">
-            <span class="status-pill pill-submitted">COMPLAINT PERSISTED</span>
-            <h2 style="color: #493A2D; margin: 10px 0 6px 0;">Complaint Successfully Submitted</h2>
-            <p style="font-size: 1.05rem; color: #493A2D; margin-bottom: 14px;">
-                Your incident has been securely recorded with Reference Number:
-            </p>
-            <div style="background-color: #F3EBDD; border: 1px dashed #356B68; padding: 14px; border-radius: 4px; font-family: monospace; font-size: 1.35rem; font-weight: 700; color: #356B68; margin-bottom: 14px;">
-                {ref_no}
-            </div>
-            <p style="font-size: 0.90rem; color: #6B5B4D; line-height: 1.45; margin-bottom: 0;">
-                <strong>Important Notice:</strong> This reference identifies your submitted complaint. It does not mean an official FIR 
-                has been registered. An authorized police officer will inspect the facts, verify the Malayalam FIR draft, 
-                and determine formal registration.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    auth_user = st.session_state.get("auth_user")
-    if not auth_user:
-        st.markdown(
-            """
-            <div class="editorial-card">
-                <h3 style="color: #493A2D; margin-top: 0;">Track Your Complaint & Receive Updates</h3>
-                <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 18px;">
-                    Create a citizen account or sign in now to link this complaint to your profile. 
-                    This enables authorized case tracking, responses to officer questions, and access to approved documents.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("Create Citizen Account 📝", type="primary", use_container_width=True):
-                navigate_to("auth_signup")
-        with c2:
-            if st.button("Sign in to Existing Account 🔑", use_container_width=True):
-                navigate_to("auth_login")
-        with c3:
-            if st.button("Return to Home 🏠", use_container_width=True):
-                navigate_to("landing")
-    else:
-        st.success(f"This complaint is automatically linked to your authenticated account ({auth_user['email']}).")
-        if st.button("Go to Citizen Dashboard 👤", type="primary"):
-            navigate_to("citizen_dashboard")
-
-
-# ==============================================================================
-# 6. AUTHENTICATION & SECURE COMPLAINT LINKING (Section 7)
-# ==============================================================================
-def render_auth_login() -> None:
-    """Renders focused, professional sign-in screen without exposed credentials."""
-    col_nav, _ = st.columns([1, 4])
-    with col_nav:
-        if st.button("⬅️ Home"):
-            navigate_to("landing")
-
-    st.markdown(
-        """
-        <div class="auth-container">
-            <h2 style="color: #493A2D; margin-top: 0; margin-bottom: 6px;">Sign in to Your Account</h2>
-            <p style="color: #6B5B4D; font-size: 0.90rem; margin-bottom: 22px;">
-                Enter your registered credentials to access your authorized portal.
-            </p>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.form("login_form"):
-        email = st.text_input("Email Address", placeholder="Enter your registered email")
-        password = st.text_input("Password", type="password", placeholder="Enter your password")
-
-        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-        if submitted:
-            success, msg, user = database.authenticate_user(email, password)
-            if success and user:
-                st.session_state["auth_user"] = user
-                role = user["role"]
-                st.success(f"Welcome back, {user['full_name']}!")
-                if role == "citizen":
-                    navigate_to("citizen_dashboard")
-                elif role == "police":
-                    navigate_to("police_dashboard")
-                elif role == "admin":
-                    navigate_to("admin_dashboard")
-            else:
-                st.error(msg)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Clean registration link
-    c_link1, c_link2 = st.columns([1, 1])
-    with c_link1:
-        if st.button("Don't have an account? Sign up 📝"):
-            navigate_to("auth_signup")
-    with c_link2:
-        if st.button("Need to track by reference? 🔍"):
+        if st.button(
+            "Track an existing complaint  ↗",
+            type="secondary",
+            use_container_width=True,
+            key="landing_track_complaint",
+        ):
             navigate_to("auth_track")
 
+        _render_html(
+            """
+            <div class="hero-note">
+                You can begin without creating an account.
+                Keep your reference number after submission.
+            </div>
+            """,
+        )
 
-def render_auth_signup() -> None:
-    """Renders clean, focused citizen registration screen."""
-    col_nav, _ = st.columns([1, 4])
-    with col_nav:
-        if st.button("⬅️ Home"):
+    with right:
+        # Illustrative view of the complaint review and police draft workflow.
+        _render_html(
+            """
+            <div class="product-stage">
+                <div class="product-window">
+                    <div class="product-window-bar">
+                        <span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span>
+                        <span class="window-address">fir assistance system / complaint review</span>
+                    </div>
+                    <div class="product-body">
+                        <div class="workflow-rail">
+                            <div class="rail-label">Your complaint</div>
+                            <div class="workflow-step">
+                                <span class="workflow-step-number">01</span>
+                                <span class="workflow-step-copy">Describe the incident</span>
+                            </div>
+                            <div class="workflow-step active">
+                                <span class="workflow-step-number">02</span>
+                                <span class="workflow-step-copy">Review your details</span>
+                            </div>
+                            <div class="workflow-step">
+                                <span class="workflow-step-number">03</span>
+                                <span class="workflow-step-copy">Police draft review</span>
+                            </div>
+                        </div>
+                        <div class="workflow-main">
+                            <div class="workflow-label">Step 02 · Citizen review</div>
+                            <div class="workflow-main-heading">Review your complaint</div>
+                            <p class="workflow-main-copy">Check the details you provided before submitting.</p>
+                            <div class="workflow-fields">
+                                <div class="workflow-field">
+                                    <div class="workflow-field-label">Category</div>
+                                    <div class="workflow-field-value">Your selected category</div>
+                                </div>
+                                <div class="workflow-field">
+                                    <div class="workflow-field-label">Incident date</div>
+                                    <div class="workflow-field-value">As provided</div>
+                                </div>
+                                <div class="workflow-field">
+                                    <div class="workflow-field-label">Location</div>
+                                    <div class="workflow-field-value">Your incident location</div>
+                                </div>
+                                <div class="workflow-field">
+                                    <div class="workflow-field-label">Language</div>
+                                    <div class="workflow-field-value">English · മലയാളം · हिन्दी</div>
+                                </div>
+                            </div>
+                            <div class="workflow-description">
+                                <div class="workflow-field-label">Original complaint</div>
+                                <p>Your description remains available for review against the generated draft.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="draft-float">
+                    <div class="draft-float-label">After submission</div>
+                    <div class="draft-float-title">Malayalam FIR draft</div>
+                    <div class="draft-float-status">Pending police review</div>
+                    <div class="draft-float-copy">A demonstration draft based on submitted details, reviewed by a person before approval.</div>
+                </div>
+            </div>
+            """,
+        )
+
+    # Three-step process
+    _render_html(
+        """
+        <div class="process-section">
+            <div class="process-heading">
+                A clearer path, from the start.
+            </div>
+        </div>
+        """,
+    )
+
+    step1, step2, step3 = st.columns(3, gap="large")
+
+    with step1:
+        _render_html(
+            """
+            <div class="process-number">01 / DESCRIBE</div>
+            <div class="process-title">Tell us what happened</div>
+            <div class="process-description">
+                Explain the incident in your own words and
+                choose your preferred language.
+            </div>
+            """,
+        )
+
+    with step2:
+        _render_html(
+            """
+            <div class="process-number">02 / VERIFY</div>
+            <div class="process-title">Review the details</div>
+            <div class="process-description">
+                Check the collected information and correct
+                anything that is inaccurate.
+            </div>
+            """,
+        )
+
+    with step3:
+        _render_html(
+            """
+            <div class="process-number">03 / FOLLOW</div>
+            <div class="process-title">Track your complaint</div>
+            <div class="process-description">
+                Keep your reference number and follow the
+                progress recorded by the system.
+            </div>
+            """,
+        )
+
+    # Important legal and emergency information
+    _render_html(
+        """
+        <div class="legal-note">
+            <strong>Important:</strong> This platform assists with
+            complaint intake and FIR preparation. A generated draft
+            is not an official FIR until it has been reviewed and
+            formally approved by authorized police personnel.
+            <br><br>
+            If someone is in immediate danger, contact the appropriate
+            emergency service or local police directly. This platform
+            does not replace emergency services or official procedures.
+        </div>
+        """,
+    )
+
+
+# ==============================================================================
+# LANGUAGE SELECTION
+# ==============================================================================
+
+LANGUAGES = {
+    "English": "en",
+    "മലയാളം": "ml",
+    "हिन्दी": "hi",
+}
+
+LANGUAGE_LABELS = {
+    "en": {
+        "title": "Choose your language",
+        "subtitle": "Select the language you are most comfortable using.",
+        "continue": "Continue",
+        "back": "Back",
+    },
+    "ml": {
+        "title": "നിങ്ങളുടെ ഭാഷ തിരഞ്ഞെടുക്കുക",
+        "subtitle": "നിങ്ങൾക്ക് സൗകര്യപ്രദമായ ഭാഷ തിരഞ്ഞെടുക്കുക.",
+        "continue": "തുടരുക",
+        "back": "തിരികെ",
+    },
+    "hi": {
+        "title": "अपनी भाषा चुनें",
+        "subtitle": "वह भाषा चुनें जिसमें आप सहज महसूस करते हैं।",
+        "continue": "जारी रखें",
+        "back": "वापस",
+    },
+}
+
+
+def render_language_select() -> None:
+    """Lets the citizen select their preferred intake language."""
+    st.markdown("## Choose your language")
+    st.write("Select the language you are most comfortable using.")
+
+    language_options = list(LANGUAGES.keys())
+    selected = st.radio(
+        "Preferred language",
+        language_options,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if st.button("Continue", type="primary", use_container_width=True):
+        lang_code = LANGUAGES[selected]
+        st.session_state["selected_language"] = lang_code
+        st.session_state["complaint_slots"] = create_empty_complaint_slots(
+            lang_code
+        )
+        st.session_state["chat_messages"] = []
+        st.session_state["chat_step_index"] = 0
+        navigate_to("complaint_chat")
+
+    if st.button("Back", use_container_width=True):
+        navigate_to("landing")
+
+
+# ==============================================================================
+# COMPLAINT INTAKE HELPERS
+# ==============================================================================
+
+def _get_language_text(en: str, ml: str, hi: str) -> str:
+    """Returns a translated string for the selected language."""
+    lang = st.session_state.get("selected_language", "en")
+    return {"en": en, "ml": ml, "hi": hi}.get(lang, en)
+
+
+def _safe_display(value: Any) -> str:
+    """Escapes user-supplied values before inserting them into HTML."""
+    if value is None:
+        return ""
+    return escape(str(value))
+
+
+def _display_value(value: Any, fallback: str = "Not provided") -> str:
+    """Returns a safe, readable value for the verification screen."""
+    if value is None or str(value).strip() == "":
+        return fallback
+    return str(value)
+
+
+def _get_complaint_slots() -> Dict[str, Any]:
+    """Returns the active complaint slot dictionary."""
+    slots = st.session_state.get("complaint_slots")
+
+    if not isinstance(slots, dict):
+        slots = create_empty_complaint_slots(
+            st.session_state.get("selected_language", "en")
+        )
+        st.session_state["complaint_slots"] = slots
+
+    return slots
+
+
+def _get_slot_label(slot_key: str) -> str:
+    """Returns a readable label for common complaint fields."""
+    labels = {
+        "name": "Complainant name",
+        "age": "Age",
+        "gender": "Gender",
+        "address": "Address",
+        "contact": "Contact number",
+        "category": "Complaint category",
+        "incident_date": "Incident date",
+        "last_seen_date": "Last seen date",
+        "last_seen_location": "Last seen location",
+        "location": "Incident location",
+        "description": "Incident description",
+        "height": "Height",
+        "clothing": "Clothing",
+        "identifying_marks": "Identifying marks",
+        "person_description": "Person description",
+    }
+    return labels.get(slot_key, slot_key.replace("_", " ").title())
+
+
+def _get_chat_steps() -> List[Any]:
+    """Returns configured chat steps from complaint_manager."""
+    steps = CHAT_STEPS
+
+    if isinstance(steps, dict):
+        lang = st.session_state.get("selected_language", "en")
+        selected_steps = steps.get(lang, steps.get("en", []))
+        return list(selected_steps)
+
+    return list(steps)
+
+
+def _extract_step_key(step: Any) -> str:
+    """Extracts a field key from the configured chat step."""
+    if isinstance(step, dict):
+        return str(
+            step.get("key")
+            or step.get("field")
+            or step.get("slot")
+            or ""
+        )
+
+    if isinstance(step, (tuple, list)) and step:
+        return str(step[0])
+
+    return str(getattr(step, "key", ""))
+
+
+def _extract_step_prompt(step: Any, lang: str) -> str:
+    """Gets the prompt for a chat step with a safe fallback."""
+    key = _extract_step_key(step)
+
+    try:
+        prompt = get_step_prompt(step, lang)
+        if prompt:
+            return str(prompt)
+    except (TypeError, KeyError, AttributeError):
+        pass
+
+    if isinstance(step, dict):
+        prompts = step.get("prompts", {})
+        if isinstance(prompts, dict):
+            return str(prompts.get(lang, prompts.get("en", key)))
+
+        return str(step.get("prompt", key))
+
+    if isinstance(step, (tuple, list)) and len(step) > 1:
+        return str(step[1])
+
+    return _get_slot_label(key)
+
+
+def _validate_step(key: str, value: str) -> Tuple[bool, str, Dict[str, Any]]:
+    """Validates one answer using the complaint manager's actual API."""
+    result = validate_chat_step_input(key, value)
+    valid, message = _validation_result(result)
+    slot_updates = (
+        result[2]
+        if valid and isinstance(result, tuple) and len(result) > 2
+        and isinstance(result[2], dict)
+        else {}
+    )
+    return valid, message, slot_updates
+
+
+def _validation_result(result: Any):
+    """Normalizes different validator return formats."""
+    if isinstance(result, tuple):
+        if len(result) >= 2:
+            return bool(result[0]), str(result[1])
+        if len(result) == 1:
+            return bool(result[0]), ""
+
+    if isinstance(result, dict):
+        valid = result.get("valid", result.get("success", False))
+        message = result.get("message", result.get("error", ""))
+        return bool(valid), str(message)
+
+    if isinstance(result, bool):
+        return result, ""
+
+    return bool(result), ""
+
+
+# ==============================================================================
+# CONVERSATIONAL COMPLAINT INTAKE
+# ==============================================================================
+
+def render_complaint_chat() -> None:
+    """Renders the guided conversational complaint intake interface."""
+    lang = st.session_state.get("selected_language", "en")
+    slots = _get_complaint_slots()
+    steps = _get_chat_steps()
+
+    with st.container(key="chat-heading"):
+        st.markdown("## Tell us what happened")
+        st.write(
+            _get_language_text(
+                "Answer the questions below. You can review your information before submitting.",
+                "താഴെയുള്ള ചോദ്യങ്ങൾക്ക് ഉത്തരം നൽകുക. സമർപ്പിക്കുന്നതിന് മുമ്പ് വിവരങ്ങൾ പരിശോധിക്കാം.",
+                "नीचे दिए गए प्रश्नों के उत्तर दें। जमा करने से पहले आप जानकारी की समीक्षा कर सकते हैं।",
+            )
+        )
+
+    with st.container(key="chat-controls", horizontal=True, gap="small"):
+        if st.button(
+            "Change language",
+            key="chat_change_language",
+            type="tertiary",
+            width="content",
+        ):
+            navigate_to("language_select")
+
+        if st.button(
+            "Use guided form instead",
+            key="chat_use_guided_form",
+            type="tertiary",
+            width="content",
+        ):
+            navigate_to("complaint_guided_form")
+
+        if st.button(
+            "Start over",
+            key="chat_start_over",
+            type="tertiary",
+            width="content",
+        ):
+            reset_intake()
+            st.rerun()
+
+    if not steps:
+        st.warning(
+            "The conversational intake steps are not configured. "
+            "You can use the guided form instead."
+        )
+        if st.button("Open guided complaint form", type="primary"):
+            navigate_to("complaint_guided_form")
+        return
+
+    messages = st.session_state.get("chat_messages", [])
+
+    with st.container(key="complaint-chat-history", gap="small"):
+        for message in messages:
+            role = message.get("role", "assistant")
+            content = message.get("content", "")
+            with st.chat_message(role):
+                st.markdown(content)
+
+        step_index = int(st.session_state.get("chat_step_index", 0))
+
+        if step_index < len(steps):
+            current_step = steps[step_index]
+            key = _extract_step_key(current_step)
+            prompt = _extract_step_prompt(current_step, lang)
+
+            if not messages or messages[-1].get("content") != prompt:
+                messages.append({"role": "assistant", "content": prompt})
+                st.session_state["chat_messages"] = messages
+                with st.chat_message("assistant"):
+                    st.markdown(prompt)
+
+    if step_index < len(steps):
+        answer = st.chat_input(
+            _get_language_text(
+                "Type your answer...",
+                "നിങ്ങളുടെ ഉത്തരം എഴുതുക...",
+                "अपना उत्तर लिखें...",
+            ),
+            key=f"chat_answer_{step_index}",
+        )
+
+        if answer is not None:
+            answer = answer.strip()
+
+            if not answer:
+                st.warning("Please enter an answer before continuing.")
+                st.rerun()
+
+            valid, message, slot_updates = _validate_step(key, answer)
+
+            if not valid:
+                st.error(message or "Please check your answer and try again.")
+                st.stop()
+
+            slots.update(slot_updates)
+            st.session_state["complaint_slots"] = slots
+
+            messages.append({"role": "user", "content": answer})
+            st.session_state["chat_messages"] = messages
+            st.session_state["chat_step_index"] = step_index + 1
+            st.rerun()
+    else:
+        st.success("You have completed the guided questions.")
+
+        if st.button("Review my complaint", type="primary"):
+            navigate_to("complaint_verify")
+
+
+# ==============================================================================
+# GUIDED FORM FALLBACK
+# ==============================================================================
+
+def render_guided_form() -> None:
+    """Provides a conventional form as a fallback to conversational intake."""
+    slots = _get_complaint_slots()
+
+    st.markdown("## Complaint details")
+    st.write(
+        "Complete the information you know. If a field does not apply, "
+        "leave it blank where permitted."
+    )
+
+    with st.form("guided_complaint_form"):
+        name = st.text_input(
+            "Complainant name",
+            value=str(slots.get("name", "")),
+        )
+        contact_number = st.text_input(
+            "Contact number",
+            value=str(slots.get("contact_number", "")),
+        )
+
+        categories = list(COMPLAINT_CATEGORIES)
+        if not categories:
+            categories = ["Other"]
+
+        current_category = str(slots.get("category", ""))
+        category_index = (
+            categories.index(current_category)
+            if current_category in categories
+            else 0
+        )
+
+        category = st.selectbox(
+            "Complaint category",
+            categories,
+            index=category_index,
+        )
+
+        saved_incident_date = str(slots.get("incident_date", "")).strip()
+        incident_date_unknown = st.checkbox(
+            "Incident date is unknown",
+            value=(
+                not bool(saved_incident_date)
+                or saved_incident_date.casefold() == "unknown"
+            ),
+        )
+
+        incident_date_default: Any = saved_incident_date
+        try:
+            if isinstance(incident_date_default, str):
+                incident_date_default = date.fromisoformat(
+                    incident_date_default
+                )
+        except ValueError:
+            incident_date_default = date.today()
+
+        if not isinstance(incident_date_default, date):
+            incident_date_default = date.today()
+
+        incident_date_value = "Unknown"
+        if not incident_date_unknown:
+            selected_incident_date = st.date_input(
+                "Incident date",
+                value=incident_date_default,
+                max_value=date.today(),
+            )
+            incident_date_value = selected_incident_date.isoformat()
+
+        incident_time = st.text_input(
+            "Approximate incident time (optional)",
+            value=str(slots.get("incident_time", "")),
+        )
+
+        location = st.text_input(
+            "Incident location",
+            value=str(slots.get("location", "")),
+        )
+
+        description = st.text_area(
+            "Describe what happened",
+            value=str(slots.get("description", "")),
+            height=180,
+        )
+
+        additional_info = st.text_area(
+            "Additional information (optional)",
+            value=str(slots.get("additional_info", "")),
+        )
+
+        submitted = st.form_submit_button(
+            "Review complaint",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        updated = {
+            "name": name.strip(),
+            "contact_number": contact_number.strip(),
+            "category": category,
+            "incident_date": incident_date_value,
+            "incident_time": incident_time.strip(),
+            "location": location.strip(),
+            "description": description.strip(),
+            "additional_info": additional_info.strip(),
+        }
+
+        slots.update(updated)
+        st.session_state["complaint_slots"] = slots
+
+        valid, errors = validate_complaint_input(
+            name=slots.get("name", ""),
+            contact_number=slots.get("contact_number", ""),
+            category=slots.get("category", ""),
+            incident_date=slots.get("incident_date"),
+            location=slots.get("location", ""),
+            description=slots.get("description", ""),
+            additional_info=slots.get("additional_info", ""),
+        )
+        if not valid:
+            for message in errors.values():
+                st.error(message)
+        else:
+            navigate_to("complaint_verify")
+
+    if st.button("← Back to conversation"):
+        navigate_to("complaint_chat")
+
+
+# ==============================================================================
+# COMPLAINT VERIFICATION
+# ==============================================================================
+
+def render_complaint_verify() -> None:
+    """Displays complaint information for citizen verification."""
+    slots = _get_complaint_slots()
+
+    st.markdown("## Review your complaint")
+    st.write(
+        "Check each detail carefully. You can go back and correct "
+        "any information before submitting."
+    )
+
+    display_fields = [
+        ("name", "Complainant name"),
+        ("contact_number", "Contact number"),
+        ("category", "Complaint category"),
+        ("incident_date", "Incident date"),
+        ("incident_time", "Incident time"),
+        ("location", "Incident location"),
+        ("description", "Incident description"),
+        ("additional_info", "Additional information"),
+    ]
+
+    with st.container(border=True):
+        for key, label in display_fields:
+            value = _display_value(slots.get(key))
+            st.markdown(f"**{label}:**")
+            st.write(value)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Edit complaint", use_container_width=True):
+            st.session_state["complaint_submission_completed"] = False
+            navigate_to("complaint_guided_form")
+
+    with col2:
+        if st.button(
+            "Submit complaint",
+            type="primary",
+            use_container_width=True,
+        ):
+            _submit_complaint(slots)
+
+
+def _submit_complaint(slots: Dict[str, Any]) -> None:
+    """Validates and stores a complaint using the database module."""
+    if st.session_state.get("complaint_submission_completed"):
+        if st.session_state.get("last_submitted_ref"):
+            navigate_to("complaint_confirmed")
+            return
+        st.error("This complaint has already been submitted.")
+        return
+
+    valid, errors = validate_complaint_input(
+        name=slots.get("name", ""),
+        contact_number=slots.get("contact_number", ""),
+        category=slots.get("category", ""),
+        incident_date=slots.get("incident_date"),
+        location=slots.get("location", ""),
+        description=slots.get("description", ""),
+        additional_info=slots.get("additional_info", ""),
+    )
+
+    if not valid:
+        for message in errors.values():
+            st.error(message)
+        return
+
+    user = _current_user()
+    citizen_user_id = (
+        user["id"] if user and user.get("role") == "citizen" else None
+    )
+    recovery_handle, recovery_handle_hash = otp_service.create_recovery_handle()
+    draft = generate_malayalam_fir_draft(
+        complainant_name=slots["name"].strip(),
+        contact_number=slots["contact_number"].strip(),
+        category=slots["category"].strip(),
+        incident_date=str(slots["incident_date"]).strip(),
+        incident_location=slots["location"].strip(),
+        description=slots["description"].strip(),
+        incident_time=str(slots.get("incident_time", "")).strip(),
+        additional_info=str(slots.get("additional_info", "")).strip(),
+    )
+
+    try:
+        success, message, record = database.save_complaint(
+            complainant_name=slots["name"],
+            contact_number=slots["contact_number"],
+            category=slots["category"],
+            incident_date=str(slots["incident_date"]),
+            incident_location=slots["location"],
+            description=slots["description"],
+            additional_info=str(slots.get("additional_info", "")),
+            incident_time=str(slots.get("incident_time", "")),
+            intake_language=st.session_state.get("selected_language", "en"),
+            citizen_user_id=citizen_user_id,
+            draft_content_ml=draft,
+            recovery_handle_hash=recovery_handle_hash,
+        )
+    except sqlite3.Error as exc:
+        st.error(_safe_error_message(exc))
+        return
+
+    if not success or not record.get("reference_no"):
+        st.error(message or "The complaint could not be saved. Please try again.")
+        return
+
+    st.session_state["last_submitted_ref"] = record["reference_no"]
+    st.session_state["last_submitted_id"] = record["id"]
+    st.session_state["last_submitted_recovery_handle"] = recovery_handle
+    st.session_state["complaint_submission_completed"] = True
+    navigate_to("complaint_confirmed")
+
+
+# ==============================================================================
+# COMPLAINT SUBMISSION CONFIRMATION
+# ==============================================================================
+
+def _send_confirmation_code(
+    handle_hash: str,
+    challenge: Dict[str, Any],
+) -> str:
+    """Reserves a rate-limited OTP and sends it through the configured provider."""
+    secret = otp_service.get_otp_secret()
+    provider = get_sms_provider()
+    code = otp_service.create_otp()
+    code_hash = otp_service.hash_otp(secret, handle_hash, code)
+    phone_hash = otp_service.hash_phone_for_rate_limit(
+        secret,
+        challenge["contact_number"],
+    )
+    now = otp_service.current_utc_time()
+
+    reserved, status = database.reserve_recovery_otp(
+        handle_hash=handle_hash,
+        phone_hash=phone_hash,
+        otp_hash=code_hash,
+        now=now,
+        otp_ttl_seconds=otp_service.OTP_TTL_SECONDS,
+        resend_cooldown_seconds=otp_service.OTP_RESEND_COOLDOWN_SECONDS,
+        send_window_seconds=otp_service.OTP_SEND_WINDOW_SECONDS,
+        max_sends_per_window=otp_service.OTP_MAX_SENDS_PER_WINDOW,
+    )
+    if not reserved:
+        return status
+
+    message = (
+        f"Your FIR Assistance System confirmation code is {code}. "
+        f"It expires in {otp_service.OTP_TTL_SECONDS // 60} minutes."
+    )
+    try:
+        provider.send_sms(challenge["contact_number"], message)
+    except SmsProviderError:
+        database.cancel_recovery_otp(handle_hash, code_hash)
+        raise
+
+    return "sent"
+
+
+def render_complaint_confirmed() -> None:
+    """Shows the reference number for a successfully submitted complaint."""
+    clear_otp = st.session_state.pop("confirmation_otp_clear_pending", False)
+    if st.session_state.get("confirmation_verified_handle") or clear_otp:
+        st.session_state.pop("confirmation_otp", None)
+    verification_feedback = st.session_state.pop(
+        "confirmation_otp_feedback",
+        None,
+    )
+
+    session_reference = st.session_state.get("last_submitted_ref")
+    session_handle = st.session_state.get("last_submitted_recovery_handle")
+    requested_handle = str(st.query_params.get("recovery", "")).strip()
+
+    if (
+        not requested_handle
+        and st.session_state.get("complaint_submission_completed")
+        and session_handle
+    ):
+        st.query_params["recovery"] = session_handle
+        requested_handle = session_handle
+
+    reference = None
+    challenge: Optional[Dict[str, Any]] = None
+    handle_hash: Optional[str] = None
+
+    if requested_handle and 40 <= len(requested_handle) <= 50:
+        handle_hash = otp_service.hash_recovery_handle(requested_handle)
+        try:
+            challenge = database.get_recovery_challenge(handle_hash)
+        except sqlite3.Error as exc:
+            st.error(_safe_error_message(exc))
+
+        if challenge:
+            recovery_expires_at = challenge.get("recovery_expires_at")
+            handle_expired = (
+                not recovery_expires_at
+                or otp_service.current_utc_time()
+                >= datetime.fromisoformat(recovery_expires_at)
+            )
+            if challenge.get("revoked_at") or handle_expired:
+                challenge = None
+
+        if challenge:
+            same_submission = (
+                st.session_state.get("complaint_submission_completed")
+                and session_handle == requested_handle
+                and session_reference == challenge["reference_no"]
+            )
+            verified_in_session = (
+                st.session_state.get("confirmation_verified_handle")
+                == handle_hash
+            )
+            if same_submission or verified_in_session:
+                reference = challenge["reference_no"]
+
+    st.markdown("## Complaint submitted")
+    if verification_feedback:
+        st.error(verification_feedback)
+
+    if reference:
+        st.success("Your complaint has been recorded.")
+        st.markdown("### Your reference number")
+        st.code(str(reference))
+        st.write(
+            "Keep this reference number safe. You may need it to check "
+            "the status of your complaint."
+        )
+    else:
+        if challenge and handle_hash:
+            st.write(
+                "To recover this confirmation, verify the one-time code sent "
+                "to the phone number used for the complaint."
+            )
+            st.caption(
+                f"Recovery messages go to "
+                f"{otp_service.mask_phone_number(challenge['contact_number'])}."
+            )
+
+            locked_until = challenge.get("locked_until")
+            locked = False
+            if locked_until:
+                locked = otp_service.current_utc_time() < datetime.fromisoformat(
+                    locked_until
+                )
+
+            if not locked:
+                last_sent_at = challenge.get("last_sent_at")
+                cooldown_active = False
+                if last_sent_at:
+                    elapsed = (
+                        otp_service.current_utc_time()
+                        - datetime.fromisoformat(last_sent_at)
+                    ).total_seconds()
+                    cooldown_active = (
+                        elapsed < otp_service.OTP_RESEND_COOLDOWN_SECONDS
+                    )
+
+                with st.form("send_confirmation_code_form"):
+                    send_submitted = st.form_submit_button(
+                        "Send or resend code",
+                        type="secondary",
+                        disabled=cooldown_active,
+                    )
+                if cooldown_active:
+                    st.caption("Please wait before requesting another code.")
+
+                if send_submitted:
+                    try:
+                        send_status = _send_confirmation_code(
+                            handle_hash,
+                            challenge,
+                        )
+                    except (ValueError, SmsProviderError) as exc:
+                        st.error(str(exc))
+                    except sqlite3.Error as exc:
+                        st.error(_safe_error_message(exc))
+                    else:
+                        if send_status == "sent":
+                            st.success(
+                                "A verification code was sent to the saved "
+                                "phone number."
+                            )
+                            st.rerun()
+                        elif send_status == "cooldown":
+                            st.warning(
+                                "Please wait before requesting another code."
+                            )
+                        elif send_status == "rate_limited":
+                            st.error(
+                                "Too many code requests. Try again later."
+                            )
+                        elif send_status == "locked":
+                            st.error(
+                                "Verification is temporarily locked. Try again later."
+                            )
+                        elif send_status == "already_verified":
+                            st.error(
+                                "Request a new verification code to recover "
+                                "this confirmation."
+                            )
+                        elif send_status in {"handle_expired", "revoked"}:
+                            st.warning(
+                                "This recovery link has expired or is no "
+                                "longer available. Start a new complaint if "
+                                "you need another confirmation link."
+                            )
+                        else:
+                            st.error(
+                                "This recovery link is no longer available."
+                            )
+
+                try:
+                    challenge = database.get_recovery_challenge(handle_hash)
+                except sqlite3.Error as exc:
+                    st.error(_safe_error_message(exc))
+                    challenge = None
+                if (
+                    challenge
+                    and challenge.get("otp_hash")
+                    and challenge.get("expires_at")
+                    and otp_service.current_utc_time()
+                    < datetime.fromisoformat(challenge["expires_at"])
+                ):
+                    with st.form("verify_confirmation_code_form"):
+                        code = st.text_input(
+                            "Six-digit SMS code",
+                            max_chars=otp_service.OTP_LENGTH,
+                            key="confirmation_otp",
+                        )
+                        verify_submitted = st.form_submit_button(
+                            "Verify code",
+                            type="primary",
+                        )
+                    if verify_submitted:
+                        try:
+                            secret = otp_service.get_otp_secret()
+                            candidate_hash = otp_service.hash_otp(
+                                secret,
+                                handle_hash,
+                                code,
+                            )
+                            verify_status = database.verify_recovery_otp(
+                                handle_hash=handle_hash,
+                                candidate_hash=candidate_hash,
+                                now=otp_service.current_utc_time(),
+                                max_attempts=otp_service.OTP_MAX_ATTEMPTS,
+                                lockout_seconds=otp_service.OTP_LOCKOUT_SECONDS,
+                            )
+                        except ValueError as exc:
+                            verification_feedback = str(exc)
+                            verify_status = "configuration_error"
+                        except sqlite3.Error as exc:
+                            verification_feedback = _safe_error_message(exc)
+                            verify_status = "database_error"
+                        if verify_status == "verified":
+                            st.session_state[
+                                "confirmation_verified_handle"
+                            ] = handle_hash
+                            st.rerun()
+                        if verify_status == "locked":
+                            verification_feedback = (
+                                "Too many incorrect codes. Verification is "
+                                "temporarily locked."
+                            )
+                        elif verify_status == "expired":
+                            verification_feedback = (
+                                "That code expired. Request a new code to continue."
+                            )
+                        elif verify_status in {"handle_expired", "revoked"}:
+                            verification_feedback = (
+                                "This recovery link has expired or is no "
+                                "longer available. Start a new complaint if "
+                                "you need another confirmation link."
+                            )
+                        elif verify_status == "invalid":
+                            verification_feedback = (
+                                "That code could not be verified. Check it "
+                                "and try again."
+                            )
+                        elif verify_status == "already_verified":
+                            verification_feedback = (
+                                "That code has already been used. Request a "
+                                "new code to continue."
+                            )
+                        elif verify_status not in {
+                            "configuration_error",
+                            "database_error",
+                        }:
+                            verification_feedback = (
+                                "That code could not be verified. Check it "
+                                "and try again."
+                            )
+                        if verification_feedback:
+                            st.session_state[
+                                "confirmation_otp_feedback"
+                            ] = verification_feedback
+                            st.session_state[
+                                "confirmation_otp_clear_pending"
+                            ] = True
+                            st.rerun()
+            elif locked:
+                st.error(
+                    "Too many incorrect codes. Verification is temporarily locked."
+                )
+        else:
+            st.warning(
+                "This confirmation cannot be verified. Use complaint tracking "
+                "with your reference and contact number, or return home to "
+                "start a new complaint."
+            )
+
+    st.info(
+        "Submitting a complaint through this platform does not itself mean "
+        "that an official FIR has been registered. Police review and formal "
+        "approval are separate steps."
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Track complaint", type="primary", use_container_width=True):
+            navigate_to("auth_track")
+
+    with col2:
+        if st.button("Return home", use_container_width=True):
             navigate_to("landing")
 
-    st.markdown(
-        """
-        <div class="auth-container">
-            <h2 style="color: #493A2D; margin-top: 0; margin-bottom: 6px;">Create Citizen Account</h2>
-            <p style="color: #6B5B4D; font-size: 0.90rem; margin-bottom: 22px;">
-                Register to track complaints and receive authorized case status updates.
-            </p>
-        """,
-        unsafe_allow_html=True,
+
+# ==============================================================================
+# AUTHENTICATION HELPERS
+# ==============================================================================
+
+def _current_user() -> Optional[Dict[str, Any]]:
+    """Returns the authenticated user, if one exists."""
+    user = st.session_state.get("auth_user")
+    return user if isinstance(user, dict) else None
+
+
+def _require_role(allowed_roles: List[str]) -> bool:
+    """Checks whether the current session has an allowed role."""
+    user = _current_user()
+
+    if not user:
+        st.warning("Please sign in to access this page.")
+        if st.button("Go to sign in"):
+            navigate_to("auth_login")
+        return False
+
+    if user.get("role") not in allowed_roles:
+        st.error("You do not have permission to access this page.")
+        return False
+
+    return True
+
+
+def _safe_error_message(error: Exception) -> str:
+    """Returns a restrained error message without exposing internals."""
+    return f"Unable to complete the request: {escape(str(error))}"
+
+
+# ==============================================================================
+# SIGN-IN PAGE
+# ==============================================================================
+
+def render_auth_login() -> None:
+    """Renders the sign-in form."""
+    st.markdown("## Sign in")
+    st.write("Sign in with the email address registered to your account.")
+
+    with st.form("login_form"):
+        email = st.text_input("Email address")
+        password = st.text_input("Password", type="password")
+
+        submitted = st.form_submit_button(
+            "Sign in",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        if not email.strip() or not password:
+            st.error("Enter both your email address and password.")
+        else:
+            try:
+                success, message, user = database.authenticate_user(
+                    email=email,
+                    password=password,
+                )
+            except sqlite3.Error as exc:
+                st.error(_safe_error_message(exc))
+            else:
+                if success and user:
+                    st.session_state["auth_user"] = user
+                    st.success("Signed in successfully.")
+                    destinations = {
+                        "citizen": "citizen_dashboard",
+                        "police": "police_dashboard",
+                        "admin": "admin_dashboard",
+                    }
+                    navigate_to(destinations[user["role"]])
+                else:
+                    st.error(message)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Create account", use_container_width=True):
+            navigate_to("auth_signup")
+
+    with col2:
+        if st.button("Back home", use_container_width=True):
+            navigate_to("landing")
+
+
+# ==============================================================================
+# ACCOUNT REGISTRATION
+# ==============================================================================
+
+def render_auth_signup() -> None:
+    """Renders citizen account registration."""
+    st.markdown("## Create an account")
+    st.write(
+        "Creating an account can help you track complaints and receive updates. "
+        "You can begin a complaint without creating an account first."
     )
 
     with st.form("signup_form"):
-        full_name = st.text_input("Full Name", placeholder="e.g., Rajesh Kumar")
-        email = st.text_input("Email Address", placeholder="e.g., citizen@example.com")
-        phone = st.text_input("Contact Phone Number", placeholder="e.g., +91 9447123456")
-        password = st.text_input("Create Password", type="password", placeholder="Minimum 6 characters")
+        full_name = st.text_input("Full name")
+        phone = st.text_input("Phone number")
+        email = st.text_input("Email address")
+        password = st.text_input("Create a password", type="password")
+        confirm_password = st.text_input(
+            "Confirm password",
+            type="password",
+        )
 
-        submitted = st.form_submit_button("Register Account", type="primary", use_container_width=True)
-        if submitted:
-            success, msg, user = database.create_user(
-                email=email,
-                full_name=full_name,
-                password=password,
-                contact_number=phone,
-                role="citizen",
-            )
-            if success and user:
-                st.session_state["auth_user"] = user
+        submitted = st.form_submit_button(
+            "Create account",
+            type="primary",
+            use_container_width=True,
+        )
 
-                # Link last complaint if phone numbers match
-                last_ref = st.session_state.get("last_submitted_ref")
-                if last_ref:
-                    database.link_complaint_to_citizen(last_ref, phone, user["id"])
-
-                st.success("Account created successfully!")
-                navigate_to("citizen_dashboard")
+    if submitted:
+        if not all(
+            [
+                full_name.strip(),
+                phone.strip(),
+                email.strip(),
+                password,
+                confirm_password,
+            ]
+        ):
+            st.error("Complete all required fields.")
+        elif password != confirm_password:
+            st.error("The passwords do not match.")
+        elif len(password) < 8:
+            st.error("Use a password with at least 8 characters.")
+        else:
+            try:
+                success, message, user = database.create_user(
+                    email=email,
+                    full_name=full_name,
+                    password=password,
+                    contact_number=phone,
+                    role="citizen",
+                )
+            except sqlite3.Error as exc:
+                st.error(_safe_error_message(exc))
             else:
-                st.error(msg)
+                if success and user:
+                    st.session_state["auth_user"] = user
+                    st.success(message)
+                    navigate_to("citizen_dashboard")
+                else:
+                    st.error(message)
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if st.button("Already have an account? Sign in 🔑"):
+    if st.button("Back to sign in", use_container_width=True):
         navigate_to("auth_login")
 
 
+# ==============================================================================
+# COMPLAINT TRACKING
+# ==============================================================================
+
 def render_auth_track() -> None:
-    """Direct complaint tracking screen requiring authentication or reference verification."""
-    col_nav, _ = st.columns([1, 4])
-    with col_nav:
-        if st.button("⬅️ Home"):
-            navigate_to("landing")
-
-    auth_user = st.session_state.get("auth_user")
-    if auth_user:
-        navigate_to("citizen_dashboard")
-        return
-
-    st.markdown(
-        """
-        <div class="editorial-card" style="max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #493A2D; margin-top: 0;">Track Complaint Status</h2>
-            <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 20px;">
-                To protect citizen privacy, confidential case information is not displayed publicly. 
-                Please sign in to your citizen account, or verify ownership with your registered contact number.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    """Allows a citizen to enter a complaint reference for tracking."""
+    st.markdown("## Track a complaint")
+    st.write(
+        "Enter the reference number and the contact number used when "
+        "submitting the complaint."
     )
 
-    c_sign, c_link = st.columns(2)
-    with c_sign:
-        st.markdown("#### Option 1: Sign In")
-        st.write("View all your linked complaints in your personal dashboard.")
-        if st.button("Sign in with Password 🔑", type="primary", use_container_width=True):
-            navigate_to("auth_login")
+    with st.form("track_complaint_form"):
+        reference = st.text_input("Complaint reference number")
+        contact = st.text_input("Contact number used in the complaint")
 
-    with c_link:
-        st.markdown("#### Option 2: Verify by Phone")
-        with st.form("lookup_form"):
-            ref_input = st.text_input("Complaint Reference No.", placeholder="e.g., CMP-20261024-XXXX")
-            phone_input = st.text_input("Registered Phone Number", placeholder="e.g., +91 9447123456")
-            checked = st.form_submit_button("Verify & Check Status")
-            if checked:
-                record = database.get_complaint_by_reference(ref_input)
-                if not record:
-                    st.error("Complaint reference number not found.")
+        submitted = st.form_submit_button(
+            "Check status",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        if not reference.strip() or not contact.strip():
+            st.error("Enter both the complaint reference number and contact number.")
+        else:
+            try:
+                complaint = database.get_complaint_by_reference(reference)
+            except sqlite3.Error as exc:
+                st.error(_safe_error_message(exc))
+            else:
+                if (
+                    not complaint
+                    or database.re_clean_phone(complaint["contact_number"])
+                    != database.re_clean_phone(contact)
+                ):
+                    st.error(
+                        "No complaint matched that reference number and contact number."
+                    )
                 else:
-                    if database.re_clean_phone(phone_input) != database.re_clean_phone(record["contact_number"]):
-                        st.error("Ownership verification failed: Phone number does not match record.")
+                    user = _current_user()
+                    if user and user.get("role") == "citizen":
+                        try:
+                            linked, link_message = database.link_complaint_to_citizen(
+                                reference_no=complaint["reference_no"],
+                                contact_number=contact,
+                                citizen_user_id=user["id"],
+                            )
+                        except sqlite3.Error as exc:
+                            st.error(_safe_error_message(exc))
+                        else:
+                            if linked:
+                                st.info(link_message)
+                    st.success("Complaint record found.")
+                    st.markdown(f"### {escape(complaint['reference_no'])}")
+                    st.write(f"Complaint status: {complaint['status']}")
+                    st.write(f"FIR draft status: {complaint['fir_status']}")
+                    st.caption(
+                        "This status is from the demonstration workflow and "
+                        "does not indicate official FIR registration."
+                    )
+
+    if st.button("Back home", use_container_width=True):
+        navigate_to("landing")
+
+# ==============================================================================
+# CITIZEN DASHBOARD
+# ==============================================================================
+
+def render_citizen_dashboard() -> None:
+    """Displays the citizen's dashboard."""
+    if not _require_role(["citizen"]):
+        return
+
+    user = _current_user()
+    if user is None:
+        st.error("The signed-in citizen session is unavailable. Please sign in again.")
+        return
+
+    st.markdown("## My dashboard")
+    st.write(
+        f"Welcome, {escape(str(user.get('full_name', 'Citizen')))}."
+    )
+    if st.button("Refresh complaints"):
+        st.rerun()
+
+    try:
+        complaints = database.get_complaints_for_citizen(user["id"])
+    except sqlite3.Error as exc:
+        st.error(_safe_error_message(exc))
+        complaints = []
+
+    if not complaints:
+        st.info("No complaints are linked to this account yet.")
+    else:
+        st.markdown("### Your complaints")
+        for complaint in complaints:
+            with st.container(border=True):
+                reference = str(complaint["reference_no"])
+                st.markdown(f"### {escape(reference)}")
+                st.write(f"Category: {complaint['category']}")
+                st.write(f"Incident date: {complaint['incident_date']}")
+                st.write(f"Incident location: {complaint['incident_location']}")
+                st.write(f"Complaint status: {complaint['status']}")
+                st.write(f"FIR draft status: {complaint['fir_status']}")
+
+                try:
+                    draft = database.get_latest_fir_draft(complaint["id"])
+                except sqlite3.Error as exc:
+                    st.error(_safe_error_message(exc))
+                    draft = None
+
+                if draft:
+                    st.caption(
+                        "Malayalam FIR Draft — Pending Human Review. "
+                        "Generated by a deterministic demonstration template, "
+                        "not an AI language model."
+                    )
+                    with st.expander("View Malayalam draft"):
+                        st.text(draft["draft_content_ml"])
+
+                    if complaint["is_approved"]:
+                        st.download_button(
+                            "Download reviewed draft",
+                            data=draft["draft_content_ml"],
+                            file_name=f"{reference}-fir-draft.txt",
+                            mime="text/plain; charset=utf-8",
+                            key=f"download_fir_{complaint['id']}",
+                        )
                     else:
-                        st.success("Ownership verified!")
-                        st.markdown(
-                            f"""
-                            <div class="editorial-card">
-                                <h4>Reference: {record['reference_no']}</h4>
-                                <p><strong>Category:</strong> {record['category']}</p>
-                                <p><strong>Date:</strong> {record['incident_date']} | <strong>Location:</strong> {record['incident_location']}</p>
-                                <p><strong>Current Status:</strong> <span class="status-pill pill-review">{record['status']}</span></p>
-                                <p><strong>FIR Status:</strong> <span class="status-pill pill-locked">{record['fir_status']}</span></p>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
+                        st.info(
+                            "Draft download is available only after police "
+                            "approval in this demonstration workflow."
                         )
 
-
-# ==============================================================================
-# 7. CITIZEN DASHBOARD (Section 7)
-# ==============================================================================
-def render_citizen_dashboard() -> None:
-    """Renders citizen personal dashboard showing linked complaints."""
-    auth_user = st.session_state.get("auth_user")
-    if not auth_user or auth_user["role"] != "citizen":
-        st.warning("Please sign in as a citizen to view this dashboard.")
-        if st.button("Go to Sign In"):
-            navigate_to("auth_login")
-        return
-
-    st.markdown(
-        f"""
-        <div style="margin-bottom: 20px;">
-            <h2 style="color: #493A2D; margin-bottom: 4px;">Citizen Case Dashboard</h2>
-            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
-                Logged in as <strong>{auth_user['full_name']}</strong> ({auth_user['email']})
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("🔗 Link an Unlinked Complaint by Reference Number"):
-        with st.form("link_form"):
-            l_ref = st.text_input("Complaint Reference No.", placeholder="e.g., CMP-20261024-XXXX")
-            l_phone = st.text_input("Registered Contact Phone", value=auth_user.get("contact_number", ""))
-            if st.form_submit_button("Verify & Link to My Account"):
-                success, msg = database.link_complaint_to_citizen(l_ref, l_phone, auth_user["id"])
-                if success:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-    complaints = database.get_complaints_for_citizen(auth_user["id"])
-    if not complaints:
-        st.markdown(
-            """
-            <div class="editorial-card" style="text-align: center; padding: 40px;">
-                <h3 style="color: #493A2D;">No Linked Complaints Found</h3>
-                <p style="color: #6B5B4D; font-size: 0.92rem; margin-bottom: 20px;">
-                    You do not currently have any complaints associated with this account.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Register a New Complaint 🚀", type="primary"):
-            navigate_to("language_select")
-        return
-
-    st.markdown(f"#### Your Registered Cases ({len(complaints)})")
-    for item in complaints:
-        with st.expander(f"Case {item['reference_no']} — {item['category']} ({item['incident_date']})"):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write(f"**Complainant:** {item['complainant_name']}")
-                st.write(f"**Contact Number:** {item['contact_number']}")
-            with c2:
-                st.write(f"**Incident Date:** {item['incident_date']}")
-                st.write(f"**Incident Location:** {item['incident_location']}")
-
-            st.write("**Submitted Facts:**")
-            st.text_area("Description", value=item["description"], height=80, disabled=True, key=f"cit_desc_{item['id']}")
-
-            st.write(f"**Current Status:** `{item['status']}`")
-            st.write(f"**FIR Status:** `{item['fir_status']}`")
-
-            # FIR Download policy
-            if not item.get("is_approved"):
-                st.markdown(
-                    "<span class='status-pill pill-locked'>🔒 FIR Download Locked</span>",
-                    unsafe_allow_html=True,
-                )
-                st.button(
-                    "Download Official FIR (PDF)",
-                    disabled=True,
-                    key=f"dl_locked_{item['id']}",
-                    help="The official FIR draft download will be unlocked only after police review and approval.",
-                )
-                st.caption("Official FIR download requires station review and approval.")
-            else:
-                st.markdown(
-                    "<span class='status-pill pill-approved'>✅ FIR Approved by Police</span>",
-                    unsafe_allow_html=True,
-                )
-                draft = database.get_latest_fir_draft(item["id"])
-                draft_content = draft["draft_content_ml"] if draft else "FIR Record"
-                st.download_button(
-                    "📥 Download Approved FIR (Official Document)",
-                    data=draft_content,
-                    file_name=f"Approved_FIR_{item['reference_no']}.txt",
-                    key=f"dl_app_{item['id']}",
-                )
-
-    st.markdown("---")
-    if st.button("Register Another Incident 🚀", type="primary"):
+    if st.button("Submit another complaint", type="primary"):
+        reset_intake()
         navigate_to("language_select")
 
 
 # ==============================================================================
-# 8. POLICE REVIEW PORTAL (Sections 8 & 9)
+# POLICE DASHBOARD
 # ==============================================================================
+
 def render_police_dashboard() -> None:
-    """Renders police officer complaint queue and side-by-side FIR review."""
-    auth_user = st.session_state.get("auth_user")
-    if not auth_user or auth_user["role"] != "police":
-        st.warning("Authorized police credentials required to access this portal.")
-        if st.button("Go to Sign In"):
-            navigate_to("auth_login")
+    """Displays the police complaint review workspace."""
+    if not _require_role(["police"]):
         return
 
-    active_case_id = st.session_state.get("active_police_case_id")
-    if active_case_id:
-        render_police_fir_review(active_case_id, auth_user)
+    reviewer = _current_user()
+    if reviewer is None:
+        st.error("The reviewer session is unavailable. Please sign in again.")
         return
 
-    st.markdown(
-        """
-        <div style="margin-bottom: 16px;">
-            <h2 style="color: #493A2D; margin-bottom: 2px;">Police Complaint Queue</h2>
-            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
-                Prioritized queue of citizen complaints awaiting review, fact inspection, and FIR drafting.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.markdown("## Police review workspace")
+    st.write(
+        "Review submitted complaints and update Malayalam FIR drafts."
+    )
+    st.caption(
+        "This prototype uses a demonstration police role. It does not "
+        "independently verify a reviewer's identity or authority."
     )
 
-    col_search, col_status, col_cat = st.columns([2, 1, 1])
-    with col_search:
-        search_kw = st.text_input("🔍 Search Reference, Name, Location", placeholder="e.g., CMP- or Aluva")
-    with col_status:
-        status_opts = ["All Statuses", "Submitted", "Pending Review", "Under Review", "More Information Required", "Accepted for Further Processing", "Closed"]
-        sel_status = st.selectbox("Status Filter", options=status_opts)
-    with col_cat:
-        cat_opts = ["All Categories"] + SUPPORTED_CATEGORIES
-        sel_cat = st.selectbox("Category Filter", options=cat_opts)
-
-    complaints = database.get_all_complaints_for_police(
-        status_filter=sel_status,
-        category_filter=sel_cat,
-        search_query=search_kw,
-    )
-
-    if not complaints:
-        st.info("No complaint records match the selected queue criteria.")
+    try:
+        cases = database.get_all_complaints_for_police()
+    except sqlite3.Error as exc:
+        st.error(_safe_error_message(exc))
         return
 
-    st.markdown(f"**Cases in Queue:** {len(complaints)}")
-    for case in complaints:
-        with st.container():
-            st.markdown(
-                f"""
-                <div class="editorial-card" style="padding: 16px; margin-bottom: 12px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-weight: 700; color: #493A2D; font-size: 1.05rem;">
-                            Case {case['reference_no']} — {case['category']}
-                        </span>
-                        <span>
-                            <span class="status-pill pill-review">{case['status']}</span>
-                            <span class="status-pill pill-locked">{case['fir_status']}</span>
-                        </span>
-                    </div>
-                    <div style="margin-top: 8px; font-size: 0.90rem; color: #493A2D;">
-                        <strong>Complainant:</strong> {case['complainant_name']} ({case['contact_number']}) | 
-                        <strong>Date:</strong> {case['incident_date']} | 
-                        <strong>Location:</strong> {case['incident_location']}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            col_rev, _ = st.columns([1.5, 4])
-            with col_rev:
-                if st.button("Inspect & Review FIR Draft 🔍", key=f"rev_{case['id']}", type="primary"):
-                    st.session_state["active_police_case_id"] = case["id"]
-                    st.rerun()
-
-
-def render_police_fir_review(complaint_id: int, officer_user: Dict[str, Any]) -> None:
-    """Side-by-side review layout (Left: Confirmed facts, Right: Editable Malayalam FIR draft)."""
-    case = database.get_complaint_by_id(complaint_id)
-    if not case:
-        st.error("Case not found.")
-        st.session_state["active_police_case_id"] = None
-        st.rerun()
-        return
-
-    col_back, col_title = st.columns([1, 4])
-    with col_back:
-        if st.button("⬅️ Back to Queue"):
-            st.session_state["active_police_case_id"] = None
-            st.rerun()
-    with col_title:
-        st.subheader(f"Case Review: {case['reference_no']}")
-
-    latest_draft = database.get_latest_fir_draft(complaint_id)
-    current_ml_draft = latest_draft["draft_content_ml"] if latest_draft else generate_malayalam_fir_draft(
-        complainant_name=case["complainant_name"],
-        contact_number=case["contact_number"],
-        category=case["category"],
-        incident_date=case["incident_date"],
-        incident_location=case["incident_location"],
-        description=case["description"],
-        incident_time=case.get("incident_time", ""),
-        additional_info=case.get("additional_info", ""),
-        reference_no=case["reference_no"],
+    tab_queue, tab_case, tab_fir = st.tabs(
+        ["Complaint queue", "Case details", "FIR drafting"]
     )
 
-    col_facts, col_draft = st.columns([1, 1], gap="medium")
-
-    with col_facts:
-        st.markdown(
-            f"""
-            <div class="editorial-card">
-                <h4 style="color: #493A2D; margin-top: 0; border-bottom: 1px solid #E2D7C3; padding-bottom: 8px;">
-                    Left Panel: Confirmed Citizen Facts
-                </h4>
-                <p><strong>Complainant:</strong> {case['complainant_name']}</p>
-                <p><strong>Contact Phone:</strong> {case['contact_number']}</p>
-                <p><strong>Category:</strong> {case['category']}</p>
-                <p><strong>Incident Date & Time:</strong> {case['incident_date']} {f"({case['incident_time']})" if case.get('incident_time') else ""}</p>
-                <p><strong>Incident Location:</strong> {case['incident_location']}</p>
-                <div style="background-color: #F3EBDD; padding: 10px; border-radius: 4px; margin-top: 10px;">
-                    <strong>Citizen Incident Statement (Original):</strong><br>
-                    <p style="white-space: pre-wrap; margin-top: 4px; font-size: 0.92rem; color: #493A2D;">{case['description']}</p>
-                </div>
-                {f"<p style='margin-top: 8px;'><strong>Additional Details:</strong> {case['additional_info']}</p>" if case.get('additional_info') else ""}
-                <hr style="border: none; border-top: 1px solid #E2D7C3; margin: 12px 0;">
-                <p><strong>Case Status:</strong> <span class="status-pill pill-review">{case['status']}</span></p>
-                <p><strong>FIR Status:</strong> <span class="status-pill pill-locked">{case['fir_status']}</span></p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        with st.expander("📜 Case Audit Trail"):
-            logs = database.get_audit_logs(complaint_id=case["id"])
-            for lg in logs:
-                st.caption(f"{lg['timestamp']} — **{lg['action']}** by {lg.get('actor_email', 'System')}: {lg.get('details', '')}")
-
-    with col_draft:
-        st.markdown(
-            """
-            <div class="editorial-card">
-                <h4 style="color: #356B68; margin-top: 0; border-bottom: 1px solid #E2D7C3; padding-bottom: 8px;">
-                    Right Panel: Editable Malayalam FIR Draft
-                </h4>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        with st.form("fir_draft_edit_form"):
-            edited_ml = st.text_area(
-                "Malayalam FIR Draft Content (Unicode)",
-                value=current_ml_draft,
-                height=340,
-                help="Inspect and edit the generated Malayalam FIR draft. Names, dates, and material facts must remain consistent.",
+    with tab_queue:
+        st.markdown("### Submitted complaints")
+        if not cases:
+            st.info("There are no submitted complaints to review.")
+        else:
+            queue_rows = [
+                {
+                    "Reference": case["reference_no"],
+                    "Complainant": case["complainant_name"],
+                    "Category": case["category"],
+                    "Incident date": case["incident_date"],
+                    "Status": case["status"],
+                    "FIR draft": case["fir_status"],
+                }
+                for case in cases
+            ]
+            st.dataframe(
+                queue_rows,
+                use_container_width=True,
+                hide_index=True,
             )
-            reviewer_note = st.text_input("Reviewer Notes / Justification", placeholder="e.g., Verified statement with station duty officer.")
 
-            c_save, c_return, c_approve = st.columns([1, 1.2, 1.2])
-            with c_save:
-                save_clicked = st.form_submit_button("Save Draft 💾")
-            with c_return:
-                return_clicked = st.form_submit_button("Return for Correction ↩️")
-            with c_approve:
-                approve_clicked = st.form_submit_button("Approve FIR Draft ✅", type="primary")
-
-        if save_clicked:
-            database.update_fir_draft(
-                complaint_id=case["id"],
-                draft_content_ml=edited_ml,
-                reviewer_user_id=officer_user["id"],
-                reviewer_notes=reviewer_note,
-                status="Pending Police Approval",
+            case_by_label = {
+                (
+                    f"{case['reference_no']} — {case['complainant_name']} "
+                    f"({case['category']})"
+                ): case["id"]
+                for case in cases
+            }
+            selected_label = st.selectbox(
+                "Choose a complaint to inspect",
+                list(case_by_label),
+                key="police_queue_selection",
             )
-            st.success("Draft edits saved successfully.")
-            st.rerun()
-
-        if return_clicked:
-            if not reviewer_note.strip():
-                st.error("Please provide a reason in Reviewer Notes when returning a complaint for correction.")
-            else:
-                database.return_complaint_for_correction(
-                    complaint_id=case["id"],
-                    officer_user_id=officer_user["id"],
-                    reason=reviewer_note.strip(),
-                )
-                st.warning("Complaint returned for correction.")
+            if st.button(
+                "Inspect & Review",
+                type="primary",
+                key="inspect_police_case",
+            ):
+                st.session_state["active_police_case_id"] = case_by_label[
+                    selected_label
+                ]
                 st.rerun()
 
-        if approve_clicked:
-            database.update_fir_draft(
-                complaint_id=case["id"],
-                draft_content_ml=edited_ml,
-                reviewer_user_id=officer_user["id"],
-                reviewer_notes=reviewer_note,
-                status="Approved",
+    case_id = st.session_state.get("active_police_case_id")
+    active_case = None
+    if case_id is not None:
+        try:
+            active_case = database.get_complaint_by_id(int(case_id))
+        except sqlite3.Error as exc:
+            st.error(_safe_error_message(exc))
+
+    with tab_case:
+        st.markdown("### Case details")
+        if not active_case:
+            st.info("Select a complaint from the queue and choose Inspect & Review.")
+        else:
+            _render_case_summary(active_case)
+            st.markdown(f"**Complainant:** {escape(active_case['complainant_name'])}")
+            st.markdown(f"**Contact:** {escape(active_case['contact_number'])}")
+            st.markdown(f"**Incident time:** {escape(active_case['incident_time'] or 'Not provided')}")
+            st.text_area(
+                "Original complaint",
+                value=active_case["description"],
+                height=180,
+                disabled=True,
+                key=f"police_original_{active_case['id']}",
             )
-            database.approve_fir_draft(
-                complaint_id=case["id"],
-                officer_user_id=officer_user["id"],
-                officer_notes=reviewer_note if reviewer_note.strip() else "Approved by Station Reviewer",
-            )
-            st.success("FIR draft approved! Citizen download has been unlocked.")
-            st.rerun()
+            if active_case.get("additional_info"):
+                st.text_area(
+                    "Additional information",
+                    value=active_case["additional_info"],
+                    height=100,
+                    disabled=True,
+                    key=f"police_additional_{active_case['id']}",
+                )
+
+    with tab_fir:
+        st.markdown("### Malayalam FIR draft")
+        if not active_case:
+            st.info("Select a complaint from the queue before reviewing its draft.")
+        else:
+            try:
+                draft = database.get_latest_fir_draft(active_case["id"])
+            except sqlite3.Error as exc:
+                st.error(_safe_error_message(exc))
+                draft = None
+
+            if not draft:
+                st.warning("No FIR draft is stored for this complaint.")
+            else:
+                st.caption(
+                    "Malayalam FIR Draft — Pending Human Review. "
+                    "The current generator is a deterministic template, not an LLM."
+                )
+                _render_html(_status_pill(draft["status"]))
+                st.write(f"Current draft status: {draft['status']}")
+                draft_text = st.text_area(
+                    "Editable Malayalam FIR draft",
+                    value=draft["draft_content_ml"],
+                    height=420,
+                    key=f"police_draft_{active_case['id']}_{draft['id']}",
+                )
+                reviewer_notes = st.text_area(
+                    "Reviewer comments",
+                    value=draft.get("reviewer_notes") or "",
+                    key=f"police_notes_{active_case['id']}_{draft['id']}",
+                )
+                reviewer_id = reviewer["id"]
+                review_confirmed = st.checkbox(
+                    "I have reviewed the draft and its complaint facts.",
+                    key=f"confirm_review_{active_case['id']}_{draft['id']}",
+                )
+
+                if st.button(
+                    "Save Changes",
+                    key=f"save_draft_{active_case['id']}",
+                ):
+                    try:
+                        saved = database.update_fir_draft(
+                            complaint_id=active_case["id"],
+                            draft_content_ml=draft_text,
+                            reviewer_user_id=reviewer_id,
+                            reviewer_notes=reviewer_notes,
+                            status="Pending Police Approval",
+                        )
+                    except sqlite3.Error as exc:
+                        st.error(_safe_error_message(exc))
+                    else:
+                        if saved:
+                            st.success("Draft changes saved; the draft remains pending review.")
+                        else:
+                            st.error("The draft could not be saved.")
+
+                action_col1, action_col2 = st.columns(2)
+                with action_col1:
+                    if st.button(
+                        "Approve FIR Draft",
+                        type="primary",
+                        disabled=not review_confirmed,
+                        key=f"approve_draft_{active_case['id']}",
+                    ):
+                        try:
+                            saved = database.update_fir_draft(
+                                complaint_id=active_case["id"],
+                                draft_content_ml=draft_text,
+                                reviewer_user_id=reviewer_id,
+                                reviewer_notes=reviewer_notes,
+                                status="Pending Police Approval",
+                            )
+                            approved = (
+                                database.approve_fir_draft(
+                                    complaint_id=active_case["id"],
+                                    officer_user_id=reviewer_id,
+                                    officer_notes=reviewer_notes
+                                    or "Approved in the demonstration review workflow.",
+                                )
+                                if saved
+                                else False
+                            )
+                        except sqlite3.Error as exc:
+                            st.error(_safe_error_message(exc))
+                        else:
+                            if approved:
+                                st.success(
+                                    "Draft approved in the demonstration workflow. "
+                                    "This is not legal registration or official filing."
+                                )
+                                st.rerun()
+                            else:
+                                st.error("The draft could not be approved.")
+
+                with action_col2:
+                    if st.button(
+                        "Return for Correction",
+                        key=f"return_draft_{active_case['id']}",
+                    ):
+                        if not reviewer_notes.strip():
+                            st.error("Enter a reason before returning the draft.")
+                        else:
+                            try:
+                                saved = database.update_fir_draft(
+                                    complaint_id=active_case["id"],
+                                    draft_content_ml=draft_text,
+                                    reviewer_user_id=reviewer_id,
+                                    reviewer_notes=reviewer_notes,
+                                    status="Pending Police Approval",
+                                )
+                                returned = (
+                                    database.return_complaint_for_correction(
+                                        complaint_id=active_case["id"],
+                                        officer_user_id=reviewer_id,
+                                        reason=reviewer_notes,
+                                    )
+                                    if saved
+                                    else False
+                                )
+                            except sqlite3.Error as exc:
+                                st.error(_safe_error_message(exc))
+                            else:
+                                if returned:
+                                    st.success("Draft returned for correction.")
+                                    st.rerun()
+                                else:
+                                    st.error("The draft could not be returned.")
 
 
 # ==============================================================================
-# 9. ADMINISTRATOR DASHBOARD (Section 10)
+# POLICE REVIEW HELPERS
 # ==============================================================================
-def render_admin_dashboard() -> None:
-    """Renders administrative portal: role management, system telemetry, audit logs."""
-    auth_user = st.session_state.get("auth_user")
-    if not auth_user or auth_user["role"] != "admin":
-        st.warning("Administrator credentials required.")
-        if st.button("Go to Sign In"):
-            navigate_to("auth_login")
-        return
 
-    st.markdown(
-        """
-        <div style="margin-bottom: 16px;">
-            <h2 style="color: #493A2D; margin-bottom: 2px;">Administrator Control & Audit Portal</h2>
-            <p style="color: #6B5B4D; font-size: 0.95rem; margin-top: 0;">
-                User role governance, system telemetry, and centralized audit trail monitoring.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def _format_case_status(status: Any) -> str:
+    """Formats a case status for display."""
+    if status is None:
+        return "Unknown"
+
+    value = str(status).strip().replace("_", " ").replace("-", " ")
+    return value.title() if value else "Unknown"
+
+
+def _status_pill(status: Any) -> str:
+    """Returns a small HTML status label."""
+    value = str(status or "").strip().lower()
+
+    css_class = {
+        "submitted": "pill-submitted",
+        "pending": "pill-submitted",
+        "under review": "pill-review",
+        "under_review": "pill-review",
+        "approved": "pill-approved",
+        "fir approved": "pill-approved",
+        "returned": "pill-returned",
+        "returned for correction": "pill-returned",
+        "rejected": "pill-returned",
+        "pending police approval": "pill-review",
+    }.get(value, "pill-locked")
+
+    label = escape(_format_case_status(status))
+
+    return (
+        f'<span class="status-pill {css_class}">'
+        f"{label}</span>"
     )
 
-    tab_users, tab_audit, tab_health = st.tabs(["User Role Management", "System Audit Logs", "Module Telemetry"])
+
+def _render_case_summary(case: Dict[str, Any]) -> None:
+    """Renders a safe summary of a case record."""
+    st.markdown("#### Complaint summary")
+
+    fields = [
+        ("reference_no", "Reference number"),
+        ("category", "Category"),
+        ("incident_date", "Incident date"),
+        ("incident_location", "Location"),
+        ("status", "Status"),
+    ]
+
+    for key, label in fields:
+        value = case.get(key, "")
+        st.markdown(f"**{label}:** {_safe_display(value)}")
+
+
+# ==============================================================================
+# ADMINISTRATOR DASHBOARD
+# ==============================================================================
+
+def render_admin_dashboard() -> None:
+    """Displays administrative controls and system status."""
+    if not _require_role(["admin"]):
+        return
+
+    admin = _current_user()
+    if admin is None:
+        st.error("The administrator session is unavailable. Please sign in again.")
+        return
+
+    st.markdown("## Administration")
+    st.write(
+        "Review user access, audit records, and application subsystem status."
+    )
+
+    tab_users, tab_audit, tab_health = st.tabs(
+        ["User management", "Audit logs", "Platform health"]
+    )
 
     with tab_users:
-        st.markdown("#### User Accounts & Role Assignment")
-        users = database.get_all_users()
-        for u in users:
-            col_u1, col_u2, col_u3 = st.columns([2, 1, 1])
-            with col_u1:
-                st.write(f"**{u['full_name']}** ({u['email']})")
-                st.caption(f"Phone: {u.get('contact_number') or 'N/A'}")
-            with col_u2:
-                st.write(f"Role: `{u['role']}`")
-            with col_u3:
-                if u["id"] != auth_user["id"]:
-                    new_r = st.selectbox(
-                        "Change Role",
-                        options=["citizen", "police", "admin"],
-                        index=["citizen", "police", "admin"].index(u["role"]),
-                        key=f"role_sel_{u['id']}",
+        st.markdown("### User management")
+        try:
+            users = database.get_all_users()
+        except sqlite3.Error as exc:
+            st.error(_safe_error_message(exc))
+            users = []
+
+        if users:
+            st.dataframe(
+                [
+                    {
+                        "Email": user["email"],
+                        "Name": user["full_name"],
+                        "Contact": user["contact_number"],
+                        "Role": user["role"],
+                        "Created": user["created_at"],
+                    }
+                    for user in users
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            user_labels = {
+                f"{user['email']} — {user['full_name']}": user["id"]
+                for user in users
+            }
+            selected_user = st.selectbox(
+                "Select an account",
+                list(user_labels),
+                key="admin_selected_user",
+            )
+            selected_role = st.selectbox(
+                "Assign role",
+                ["citizen", "police", "admin"],
+                key="admin_new_role",
+            )
+            if st.button("Update role", key="admin_update_role"):
+                try:
+                    updated = database.update_user_role(
+                        user_id=user_labels[selected_user],
+                        new_role=selected_role,
+                        admin_user_id=admin["id"],
                     )
-                    if st.button("Update Role", key=f"up_r_{u['id']}"):
-                        database.update_user_role(u["id"], new_r, auth_user["id"])
-                        st.success(f"Updated role for {u['email']} to {new_r}.")
+                except sqlite3.Error as exc:
+                    st.error(_safe_error_message(exc))
+                else:
+                    if updated:
+                        st.success("Account role updated.")
                         st.rerun()
+                    else:
+                        st.error("The account role was not changed.")
+        else:
+            st.info("No user records are available.")
 
     with tab_audit:
-        st.markdown("#### Centralized Audit Trail")
-        all_logs = database.get_audit_logs(limit=100)
-        for lg in all_logs:
-            ref_badge = f" [Case: {lg['reference_no']}]" if lg.get("reference_no") else ""
-            st.markdown(
-                f"""
-                <div style="background-color: #FFFCF6; border-left: 3px solid #356B68; padding: 8px 12px; margin-bottom: 8px; border-radius: 4px; font-size: 0.88rem;">
-                    <strong>{lg['timestamp']}</strong> — <code>{lg['action']}</code>{ref_badge}<br>
-                    <span style="color: #6B5B4D;">Actor: {lg.get('actor_email', 'System')} ({lg.get('actor_role', 'N/A')})</span><br>
-                    {lg.get('details', '')}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+        st.markdown("### Audit logs")
+        try:
+            audit_logs = database.get_audit_logs(limit=100)
+        except sqlite3.Error as exc:
+            st.error(_safe_error_message(exc))
+        else:
+            if audit_logs:
+                st.dataframe(
+                    audit_logs,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("No audit events have been recorded.")
 
     with tab_health:
         st.markdown("#### Platform Health & Subsystems")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Database Storage", "SQLite Relational (Operational)")
-        with c2:
-            st.metric("Complaint Intake Engine", "Multilingual Chat & Form Fallback (Operational)")
-        with c3:
-            st.metric("Malayalam FIR Engine", "Fact-Faithful Generator (Operational)")
 
-        st.info("Phase 2 (Missing Person Records) and Phase 3 (CCTV Video Processing) are scheduled for subsequent roadmap milestones.")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.metric(
+                "Database Storage",
+                "SQLite Relational (Operational)",
+            )
+
+        with c2:
+            st.metric(
+                "Complaint Intake Engine",
+                "Multilingual Chat & Form Fallback",
+            )
+
+        with c3:
+            st.metric(
+                "Malayalam FIR Engine",
+                "Draft generator configured",
+            )
+
+        st.info(
+            "Missing-person records and CCTV video processing are later "
+            "roadmap milestones. Do not treat these features as implemented "
+            "until their modules are integrated and tested."
+        )
 
 
 # ==============================================================================
 # MAIN APPLICATION ROUTER
 # ==============================================================================
+
 def main() -> None:
     """Main application routing controller."""
     st.set_page_config(
@@ -1401,37 +2790,45 @@ def main() -> None:
     )
 
     init_session_state()
+
+    page_definitions = {
+        "landing": ("FIR Assistance System", render_landing_page),
+        "language_select": ("Choose your language", render_language_select),
+        "complaint_chat": ("Complaint conversation", render_complaint_chat),
+        "complaint_guided_form": ("Complaint details", render_guided_form),
+        "complaint_verify": ("Review complaint", render_complaint_verify),
+        "complaint_confirmed": ("Complaint submitted", render_complaint_confirmed),
+        "auth_login": ("Sign in", render_auth_login),
+        "auth_signup": ("Create an account", render_auth_signup),
+        "auth_track": ("Track complaint", render_auth_track),
+        "citizen_dashboard": ("Citizen dashboard", render_citizen_dashboard),
+        "police_dashboard": ("Police review", render_police_dashboard),
+        "admin_dashboard": ("Administration", render_admin_dashboard),
+    }
+    global _APP_PAGE_OBJECTS
+    _APP_PAGE_OBJECTS = {
+        route: st.Page(
+            renderer,
+            title=title,
+            url_path=None if route == "landing" else route,
+            default=route == "landing",
+        )
+        for route, (title, renderer) in page_definitions.items()
+    }
+    active_page = st.navigation(
+        list(_APP_PAGE_OBJECTS.values()),
+        position="hidden",
+    )
+    current_page = next(
+        route
+        for route, page in _APP_PAGE_OBJECTS.items()
+        if page is active_page
+    )
+    st.session_state["current_page"] = current_page
+
     apply_custom_styles()
     render_top_navbar()
-
-    current_page = st.session_state.get("current_page", "landing")
-
-    if current_page == "landing":
-        render_landing_page()
-    elif current_page == "language_select":
-        render_language_select()
-    elif current_page == "complaint_chat":
-        render_complaint_chat()
-    elif current_page == "complaint_guided_form":
-        render_guided_form()
-    elif current_page == "complaint_verify":
-        render_complaint_verify()
-    elif current_page == "complaint_confirmed":
-        render_complaint_confirmed()
-    elif current_page == "auth_login":
-        render_auth_login()
-    elif current_page == "auth_signup":
-        render_auth_signup()
-    elif current_page == "auth_track":
-        render_auth_track()
-    elif current_page == "citizen_dashboard":
-        render_citizen_dashboard()
-    elif current_page == "police_dashboard":
-        render_police_dashboard()
-    elif current_page == "admin_dashboard":
-        render_admin_dashboard()
-    else:
-        render_landing_page()
+    active_page.run()
 
 
 if __name__ == "__main__":

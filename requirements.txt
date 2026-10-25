@@ -1,2 +1,2 @@
 # Requirements for Stage 1: Basic Streamlit Application Interface
-streamlit>=1.35.0
+streamlit>=1.36.0

@@ -10,7 +10,7 @@ Manages relational persistence across application restarts:
 4. Audit Logs (immutable action history with timestamps and actor tracking).
 """
 
-from datetime import datetime, date
+from datetime import datetime, timedelta, timezone
 import hashlib
 from contextlib import contextmanager
 import os
@@ -18,7 +18,11 @@ import secrets
 import sqlite3
 from typing import Dict, Any, List, Optional, Tuple, Generator
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fir_system.db")
+DB_PATH = os.environ.get("FIR_SYSTEM_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "fir_system.db",
+)
+RECOVERY_HANDLE_TTL_SECONDS = 24 * 60 * 60
 
 
 @contextmanager
@@ -93,6 +97,78 @@ def init_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (citizen_user_id) REFERENCES users (id) ON DELETE SET NULL
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS complaint_recovery_challenges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                complaint_id INTEGER NOT NULL UNIQUE,
+                handle_hash TEXT NOT NULL UNIQUE,
+                recovery_expires_at TEXT,
+                revoked_at TEXT,
+                otp_hash TEXT,
+                expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                send_count INTEGER NOT NULL DEFAULT 0,
+                send_window_started_at TEXT,
+                last_sent_at TEXT,
+                locked_until TEXT,
+                verified_at TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (complaint_id) REFERENCES complaints (id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        recovery_columns = {
+            row["name"]
+            for row in cursor.execute(
+                "PRAGMA table_info(complaint_recovery_challenges)"
+            ).fetchall()
+        }
+        if "recovery_expires_at" not in recovery_columns:
+            cursor.execute(
+                "ALTER TABLE complaint_recovery_challenges "
+                "ADD COLUMN recovery_expires_at TEXT"
+            )
+        if "revoked_at" not in recovery_columns:
+            cursor.execute(
+                "ALTER TABLE complaint_recovery_challenges ADD COLUMN revoked_at TEXT"
+            )
+
+        # Existing handles get a bounded lifetime based on their original creation.
+        for challenge in cursor.execute(
+            """
+            SELECT id, created_at
+            FROM complaint_recovery_challenges
+            WHERE recovery_expires_at IS NULL
+            """
+        ).fetchall():
+            created_at = datetime.fromisoformat(str(challenge["created_at"]))
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            recovery_expires_at = (
+                created_at.astimezone(timezone.utc)
+                + timedelta(seconds=RECOVERY_HANDLE_TTL_SECONDS)
+            ).isoformat()
+            cursor.execute(
+                """
+                UPDATE complaint_recovery_challenges
+                SET recovery_expires_at = ?
+                WHERE id = ?
+                """,
+                (recovery_expires_at, challenge["id"]),
+            )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sms_otp_rate_limits (
+                phone_hash TEXT PRIMARY KEY,
+                window_started_at TEXT NOT NULL,
+                send_count INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -298,6 +374,7 @@ def save_complaint(
     intake_language: str = "en",
     citizen_user_id: Optional[int] = None,
     draft_content_ml: Optional[str] = None,
+    recovery_handle_hash: Optional[str] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Persists a verified complaint into the SQLite database.
@@ -337,7 +414,14 @@ def save_complaint(
         complaint_id = cursor.lastrowid
 
         # Insert initial FIR draft
-        initial_draft = draft_content_ml if draft_content_ml else "കരട് എഫ്.ഐ.ആർ തയ്യാറാക്കുന്നു..."
+        if draft_content_ml:
+            initial_draft = draft_content_ml.replace(
+                "Reference ID): CMP-DRAFT",
+                f"Reference ID): {ref_no}",
+                1,
+            )
+        else:
+            initial_draft = "കരട് എഫ്.ഐ.ആർ തയ്യാറാക്കുന്നു..."
         cursor.execute(
             """
             INSERT INTO fir_drafts (complaint_id, draft_content_ml, status)
@@ -345,6 +429,21 @@ def save_complaint(
             """,
             (complaint_id, initial_draft),
         )
+
+        if recovery_handle_hash:
+            recovery_expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=RECOVERY_HANDLE_TTL_SECONDS)
+            ).isoformat()
+            cursor.execute(
+                """
+                INSERT INTO complaint_recovery_challenges (
+                    complaint_id, handle_hash, recovery_expires_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (complaint_id, recovery_handle_hash, recovery_expires_at),
+            )
 
         conn.commit()
 
@@ -377,6 +476,273 @@ def get_complaint_by_reference(reference_no: str) -> Optional[Dict[str, Any]]:
         cursor.execute("SELECT * FROM complaints WHERE reference_no = ?", (cleaned,))
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+def get_recovery_challenge(handle_hash: str) -> Optional[Dict[str, Any]]:
+    """Returns a recovery challenge and its complaint contact/reference data."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT r.*, c.reference_no, c.contact_number
+            FROM complaint_recovery_challenges r
+            JOIN complaints c ON c.id = r.complaint_id
+            WHERE r.handle_hash = ?
+            """,
+            (handle_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def reserve_recovery_otp(
+    handle_hash: str,
+    phone_hash: str,
+    otp_hash: str,
+    now: datetime,
+    otp_ttl_seconds: int = 300,
+    resend_cooldown_seconds: int = 60,
+    send_window_seconds: int = 900,
+    max_sends_per_window: int = 3,
+) -> Tuple[bool, str]:
+    """Atomically reserves an OTP send and enforces persisted phone limits."""
+    now = now.astimezone(timezone.utc)
+    now_text = now.isoformat()
+    with get_db_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        challenge = conn.execute(
+            """
+            SELECT id, recovery_expires_at, revoked_at, last_sent_at, locked_until,
+                   send_count, send_window_started_at
+            FROM complaint_recovery_challenges
+            WHERE handle_hash = ?
+            """,
+            (handle_hash,),
+        ).fetchone()
+        if challenge is None:
+            return False, "not_found"
+        if challenge["revoked_at"]:
+            return False, "revoked"
+        recovery_expires_at = challenge["recovery_expires_at"]
+        if (
+            not recovery_expires_at
+            or now >= datetime.fromisoformat(recovery_expires_at)
+        ):
+            return False, "handle_expired"
+
+        locked_until = challenge["locked_until"]
+        if locked_until and now < datetime.fromisoformat(locked_until):
+            return False, "locked"
+
+        last_sent_at = challenge["last_sent_at"]
+        if last_sent_at:
+            elapsed = (now - datetime.fromisoformat(last_sent_at)).total_seconds()
+            if elapsed < resend_cooldown_seconds:
+                return False, "cooldown"
+
+        window_started_at = challenge["send_window_started_at"]
+        challenge_send_count = challenge["send_count"]
+        if (
+            not window_started_at
+            or (now - datetime.fromisoformat(window_started_at)).total_seconds()
+            >= send_window_seconds
+        ):
+            window_started_at = now_text
+            challenge_send_count = 0
+
+        rate_limit = conn.execute(
+            """
+            SELECT window_started_at, send_count
+            FROM sms_otp_rate_limits
+            WHERE phone_hash = ?
+            """,
+            (phone_hash,),
+        ).fetchone()
+        if rate_limit:
+            rate_window = datetime.fromisoformat(rate_limit["window_started_at"])
+            if (now - rate_window).total_seconds() < send_window_seconds:
+                if rate_limit["send_count"] >= max_sends_per_window:
+                    return False, "rate_limited"
+                conn.execute(
+                    """
+                    UPDATE sms_otp_rate_limits
+                    SET send_count = send_count + 1
+                    WHERE phone_hash = ?
+                    """,
+                    (phone_hash,),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sms_otp_rate_limits (
+                        phone_hash, window_started_at, send_count
+                    )
+                    VALUES (?, ?, 1)
+                    """,
+                    (phone_hash, now_text),
+                )
+        else:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sms_otp_rate_limits (
+                    phone_hash, window_started_at, send_count
+                )
+                VALUES (?, ?, 1)
+                """,
+                (phone_hash, now_text),
+            )
+
+        if challenge_send_count >= max_sends_per_window:
+            return False, "rate_limited"
+
+        conn.execute(
+            """
+            UPDATE complaint_recovery_challenges
+            SET otp_hash = ?, expires_at = ?, attempt_count = 0,
+                send_count = ?, send_window_started_at = ?,
+                last_sent_at = ?, locked_until = NULL, verified_at = NULL
+            WHERE handle_hash = ?
+            """,
+            (
+                otp_hash,
+                (now + timedelta(seconds=otp_ttl_seconds)).isoformat(),
+                challenge_send_count + 1,
+                window_started_at,
+                now_text,
+                handle_hash,
+            ),
+        )
+        conn.commit()
+        return True, "sent"
+
+
+def cancel_recovery_otp(handle_hash: str, otp_hash: str) -> None:
+    """Invalidates an OTP when the SMS provider fails to deliver it."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE complaint_recovery_challenges
+            SET otp_hash = NULL, expires_at = NULL
+            WHERE handle_hash = ? AND otp_hash = ? AND verified_at IS NULL
+            """,
+            (handle_hash, otp_hash),
+        )
+        conn.commit()
+
+
+def revoke_recovery_challenge(
+    handle_hash: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Revokes a recovery handle and invalidates any pending OTP."""
+    revoked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE complaint_recovery_challenges
+            SET revoked_at = ?, otp_hash = NULL, expires_at = NULL,
+                verified_at = NULL
+            WHERE handle_hash = ? AND revoked_at IS NULL
+            """,
+            (revoked_at.isoformat(), handle_hash),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def verify_recovery_otp(
+    handle_hash: str,
+    candidate_hash: str,
+    now: datetime,
+    max_attempts: int = 5,
+    lockout_seconds: int = 900,
+) -> str:
+    """Checks and consumes an OTP, recording failures under a write lock."""
+    now = now.astimezone(timezone.utc)
+    with get_db_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        challenge = conn.execute(
+            """
+            SELECT otp_hash, expires_at, recovery_expires_at, revoked_at,
+                   attempt_count, locked_until, verified_at
+            FROM complaint_recovery_challenges
+            WHERE handle_hash = ?
+            """,
+            (handle_hash,),
+        ).fetchone()
+        if challenge is None:
+            return "not_found"
+        if challenge["revoked_at"]:
+            return "revoked"
+        recovery_expires_at = challenge["recovery_expires_at"]
+        if (
+            not recovery_expires_at
+            or now >= datetime.fromisoformat(recovery_expires_at)
+        ):
+            return "handle_expired"
+        if challenge["verified_at"]:
+            return "already_verified"
+        if challenge["locked_until"]:
+            if now < datetime.fromisoformat(challenge["locked_until"]):
+                return "locked"
+            conn.execute(
+                """
+                UPDATE complaint_recovery_challenges
+                SET locked_until = NULL, attempt_count = 0
+                WHERE handle_hash = ?
+                """,
+                (handle_hash,),
+            )
+            attempt_count = 0
+        else:
+            attempt_count = challenge["attempt_count"]
+        if not challenge["otp_hash"] or not challenge["expires_at"]:
+            return "not_sent"
+        if now >= datetime.fromisoformat(challenge["expires_at"]):
+            conn.execute(
+                """
+                UPDATE complaint_recovery_challenges
+                SET otp_hash = NULL, expires_at = NULL
+                WHERE handle_hash = ?
+                """,
+                (handle_hash,),
+            )
+            conn.commit()
+            return "expired"
+        if secrets.compare_digest(challenge["otp_hash"], candidate_hash):
+            conn.execute(
+                """
+                UPDATE complaint_recovery_challenges
+                SET otp_hash = NULL, expires_at = NULL, verified_at = ?,
+                    locked_until = NULL
+                WHERE handle_hash = ?
+                """,
+                (now.isoformat(), handle_hash),
+            )
+            conn.commit()
+            return "verified"
+
+        attempts = attempt_count + 1
+        locked_until = (
+            (now + timedelta(seconds=lockout_seconds)).isoformat()
+            if attempts >= max_attempts
+            else None
+        )
+        conn.execute(
+            """
+            UPDATE complaint_recovery_challenges
+            SET attempt_count = ?, otp_hash = ?, expires_at = ?,
+                locked_until = ?
+            WHERE handle_hash = ?
+            """,
+            (
+                attempts,
+                None if locked_until else challenge["otp_hash"],
+                None if locked_until else challenge["expires_at"],
+                locked_until,
+                handle_hash,
+            ),
+        )
+        conn.commit()
+        return "locked" if locked_until else "invalid"
 
 
 def get_complaints_for_citizen(citizen_user_id: int) -> List[Dict[str, Any]]:
