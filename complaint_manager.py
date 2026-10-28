@@ -18,6 +18,8 @@ import hashlib
 import re
 from typing import Dict, Tuple, Any, List, Optional, Union
 
+from citizen_i18n import CHAT_PROMPTS, conversation_prompt
+
 # Supported complaint categories (with Malayalam translations for accessibility)
 SUPPORTED_CATEGORIES: List[str] = [
     "Theft / Burglary (മോഷണം)",
@@ -186,48 +188,13 @@ def validate_complaint_input(
 
 # ==============================================================================
 # MULTILINGUAL PROMPTS
-# ==============================================================================
-MULTILINGUAL_PROMPTS = {
-    "en": {
-        "welcome": "Welcome to the Incident Reporting Assistant. Please describe what happened in your own words. You may write in English, Malayalam, or Hindi.",
-        "description": "Please describe the incident in detail (chronological order, what took place, persons involved).",
-        "name": "Thank you for explaining what happened. To proceed, what is your **Full Name**?",
-        "contact": "Please provide your **Contact Phone Number** so investigating personnel can reach you (e.g., `+91 98765 43210`).",
-        "category": "Please select the **Complaint Category** that best describes this incident:",
-        "date_time": "When did this incident occur? Provide the **Incident Date** (`Today`, `Yesterday`, or `YYYY-MM-DD`) and approximate time if known. If the date is unknown, type `Unknown`.",
-        "location": "Where did the incident take place? Please specify the **Incident Location** (street, junction, landmark, town).",
-        "additional_info": "Do you have any **Additional Information** to add (e.g., vehicle numbers, witnesses, lost property serials)? Type 'None' or click Skip if not applicable.",
-        "completed": "All necessary details have been collected! Please review and verify your facts before final confirmation.",
-    },
-    "ml": {
-        "welcome": "പരാതി രജിസ്ട്രേഷൻ അസിസ്റ്റന്റിലേക്ക് സ്വാഗതം. സംഭവിച്ച കാര്യങ്ങൾ നിങ്ങളുടെ സ്വന്തം വാക്കുകളിൽ വിവരിക്കുക.",
-        "description": "സംഭവം എന്താണെന്ന് വ്യക്തമായി വിവരിക്കുക (നടന്ന കാര്യങ്ങൾ, വ്യക്തികൾ).",
-        "name": "വിവരങ്ങൾക്ക് നന്ദി. പരാതിക്കാരന്റെ **പൂർണ്ണ നാമം (Full Name)** എന്താണ്?",
-        "contact": "ബന്ധപ്പെടാനുള്ള **ഫോൺ നമ്പർ (Contact Number)** നൽകുക (ഉദാ: `+91 9447123456`).",
-        "category": "സംഭവം ഏത് **വിഭാഗത്തിൽ (Complaint Category)** ഉൾപ്പെടുന്നു എന്ന് തിരഞ്ഞെടുക്കുക:",
-        "date_time": "സംഭവം നടന്ന **തീയതിയും ഏകദേശ സമയവും (Date & Time)** വ്യക്തമാക്കുക (ഉദാ: `ഇന്ന് വൈകുന്നേരം 4 മണി` അല്ലെങ്കിൽ `2026-10-24`). തീയതി അറിയില്ലെങ്കിൽ `അറിയില്ല` എന്ന് എഴുതുക.",
-        "location": "സംഭവം നടന്ന **സ്ഥലം (Incident Location)** വ്യക്തമാക്കുക (സ്ഥലപ്പേര്, റോഡ്, നഗരം).",
-        "additional_info": "മറ്റെന്തെങ്കിലും **കൂടുതൽ വിവരങ്ങൾ (Additional Info)** ഉണ്ടോ (വാഹന നമ്പർ, സാക്ഷികൾ)? ഇല്ലെങ്കിൽ 'ഇല്ല' എന്ന് ടൈപ്പ് ചെയ്യുക.",
-        "completed": "എല്ലാ പ്രധാന വിവരങ്ങളും ശേഖരിച്ചു കഴിഞ്ഞു! പരാതി സമർപ്പിക്കുന്നതിന് മുൻപായി വിവരങ്ങൾ പരിശോധിച്ച് ഉറപ്പുവരുത്തുക.",
-    },
-    "hi": {
-        "welcome": "शिकायत सहायता प्रणाली में आपका स्वागत है। कृपया घटना का विवरण अपने शब्दों में लिखें।",
-        "description": "कृपया घटना का विस्तृत विवरण दें (क्या हुआ, कौन शामिल था)।",
-        "name": "धन्यवाद। आगे बढ़ने के लिए कृपया अपना **पूरा नाम (Full Name)** बताएं।",
-        "contact": "कृपया अपना **संपर्क फोन नंबर (Contact Number)** प्रदान करें (जैसे `+91 98765 43210`)।",
-        "category": "कृपया इस घटना के लिए उपयुक्त **शिकायत श्रेणी (Category)** चुनें:",
-        "date_time": "यह घटना कब घटी? कृपया **तारीख और अनुमानित समय (Date & Time)** बताएं (जैसे `आज दोपहर 3 बजे` या `YYYY-MM-DD`)। यदि तारीख अज्ञात है, तो `पता नहीं` लिखें।",
-        "location": "घटना किस **स्थान (Location)** पर हुई? कृपया जगह का नाम या पता लिखें।",
-        "additional_info": "क्या आपके पास कोई **अतिरिक्त जानकारी (Additional Details)** है (जैसे वाहन संख्या, गवाह)? यदि नहीं, तो 'कोई नहीं' लिखें।",
-        "completed": "सभी आवश्यक जानकारी दर्ज कर ली गई है! कृपया पुष्टि करने से पहले अपने विवरण की समीक्षा करें।",
-    },
-}
+# Kept as a compatibility alias; citizen-facing strings live in citizen_i18n.
+MULTILINGUAL_PROMPTS = CHAT_PROMPTS
 
 
 def get_step_prompt(step_name: str, lang: str = "en") -> str:
-    """Returns the conversational prompt for a given step in the chosen language."""
-    prompts = MULTILINGUAL_PROMPTS.get(lang, MULTILINGUAL_PROMPTS["en"])
-    return prompts.get(step_name, "Please provide the requested information.")
+    """Returns a centrally translated question for the selected intake language."""
+    return conversation_prompt(step_name, lang)
 
 
 def validate_chat_step_input(
@@ -384,8 +351,9 @@ FIRST INFORMATION REPORT DRAFT (PENDING POLICE REVIEW)
 
 --------------------------------------------------------------------------------
 നിയമപരമായ നിരാകരണം (Operational Notice):
-ഈ രേഖ പരാതിക്കാരൻ നൽകിയ വസ്തുതകളെ ആധാരമാക്കി തയ്യാറാക്കിയ പ്രഥമ വിവര കരട് (Draft) മാത്രമാണ്. 
-അധികാരപ്പെടുത്തിയ പോലീസ് ഉദ്യോഗസ്ഥന്റെ പരിശോധനയ്ക്കും അംഗീകാരത്തിനും ശേഷമേ ഇത് നിയമപരമായ എഫ്.ഐ.ആർ ആയി രജിസ്റ്റർ ചെയ്യപ്പെടുകയുള്ളൂ.
+ഈ രേഖ പരാതിക്കാരൻ നൽകിയ വിവരങ്ങളെ അടിസ്ഥാനമാക്കി തയ്യാറാക്കിയ മാതൃകാ കരട് മാത്രമാണ്.
+ഈ ആപ്ലിക്കേഷനിലെ പരിശോധനയോ അംഗീകാരമോ ഇതിനെ ഔദ്യോഗികമായി രജിസ്റ്റർ ചെയ്ത എഫ്.ഐ.ആർ ആക്കുന്നില്ല.
+ഔദ്യോഗിക രജിസ്ട്രേഷൻ നിലവിലുള്ള പോലീസ് നടപടിക്രമങ്ങൾ പ്രകാരം മാത്രമാണ് നടക്കുക.
 """
     return draft_template.strip()
 

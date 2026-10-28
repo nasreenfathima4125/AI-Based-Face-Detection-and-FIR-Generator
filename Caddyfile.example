@@ -1,0 +1,12 @@
+{
+	admin off
+}
+
+http://localhost:8500 {
+	bind 127.0.0.1
+
+	@authentication path /auth/*
+	reverse_proxy @authentication 127.0.0.1:8502
+
+	reverse_proxy 127.0.0.1:8501
+}

@@ -42,11 +42,32 @@ from complaint_manager import (
     create_empty_complaint_slots,
     compute_submission_fingerprint,
     create_complaint_record,
+    generate_malayalam_fir_draft,
 )
 
 
 class TestComplaintValidationStage2(unittest.TestCase):
     """Test suite covering Stage 2 validation rules and record management."""
+
+    def test_template_draft_disclaims_official_registration(self):
+        """Prototype approval must not be presented as official FIR registration."""
+        draft = generate_malayalam_fir_draft(
+            complainant_name="Fictional Citizen",
+            contact_number="9000000000",
+            category="Theft / Burglary (മോഷണം)",
+            incident_date="Unknown",
+            incident_location="Sample Town",
+            description="Fictional details for a template disclaimer test.",
+        )
+
+        self.assertIn("മാതൃകാ കരട്", draft)
+        self.assertIn(
+            "അംഗീകാരമോ ഇതിനെ ഔദ്യോഗികമായി രജിസ്റ്റർ ചെയ്ത എഫ്.ഐ.ആർ ആക്കുന്നില്ല",
+            draft,
+        )
+        self.assertIn("നിലവിലുള്ള പോലീസ് നടപടിക്രമങ്ങൾ", draft)
+        self.assertNotIn("AI-Generated", draft)
+        self.assertNotIn("ശേഷമേ ഇത് നിയമപരമായ എഫ്.ഐ.ആർ ആയി രജിസ്റ്റർ ചെയ്യപ്പെടുകയുള്ളൂ", draft)
 
     def test_valid_english_complaint(self):
         """Test submission of a completely valid complaint in English."""

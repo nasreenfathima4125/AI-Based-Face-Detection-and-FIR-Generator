@@ -24,13 +24,27 @@ Architecture & Design System:
 
 from datetime import date, datetime
 from html import escape
+import ipaddress
+import logging
+import os
 import sqlite3
 from textwrap import dedent
 from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
+import auth_sessions
 import database
+import platform_health
 import otp_service
+from citizen_i18n import (
+    category_value_from_label,
+    conversation_prompt,
+    translate,
+    translate_category,
+    translate_feedback,
+    translate_status,
+    translate_validation_message,
+)
 from sms_provider import SmsProviderError, get_sms_provider
 
 from complaint_manager import (
@@ -44,6 +58,7 @@ from complaint_manager import (
 )
 
 _APP_PAGE_OBJECTS: Dict[str, Any] = {}
+_LOGGER = logging.getLogger(__name__)
 
 
 # ==============================================================================
@@ -54,9 +69,6 @@ def init_session_state() -> None:
     """Initializes session state for persistent routing and user sessions."""
     if "current_page" not in st.session_state:
         st.session_state["current_page"] = "landing"
-
-    if "auth_user" not in st.session_state:
-        st.session_state["auth_user"] = None
 
     if "selected_language" not in st.session_state:
         st.session_state["selected_language"] = "en"
@@ -281,14 +293,76 @@ def apply_custom_styles() -> None:
             outline: 3px solid rgba(53, 107, 104, .45) !important;
             outline-offset: 2px !important;
         }
+        .auth-sign-out-link {
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            min-height: 42px;
+            padding: 0 12px;
+            border: 1px solid #CFC3B2;
+            border-radius: 7px;
+            background: var(--ivory);
+            color: var(--espresso) !important;
+            font-weight: 600;
+            text-decoration: none !important;
+        }
+        .auth-gateway-link {
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            min-height: 42px;
+            padding: 0 16px;
+            border: 1px solid var(--teal);
+            border-radius: 7px;
+            background: var(--teal);
+            color: var(--ivory) !important;
+            font-weight: 600;
+            text-decoration: none !important;
+        }
+        .auth-gateway-link:hover {
+            border-color: var(--teal-hover);
+            background: var(--teal-hover);
+        }
+        .auth-gateway-link:focus-visible {
+            outline: 3px solid rgba(53, 107, 104, .45);
+            outline-offset: 2px;
+        }
+        .auth-gateway-link.secondary {
+            border-color: #CFC3B2;
+            background: var(--ivory);
+            color: var(--espresso) !important;
+        }
+        .auth-gateway-link.secondary:hover {
+            border-color: var(--teal);
+            background: #F0E8DA;
+        }
+        .form-switch {
+            margin-top: 16px;
+            color: var(--muted);
+            font-size: .9rem;
+        }
+        .auth-sign-out-link:hover {
+            background: #F0E8DA;
+            border-color: var(--teal);
+        }
+        .auth-sign-out-link:focus-visible {
+            outline: 3px solid rgba(53, 107, 104, .45);
+            outline-offset: 2px;
+        }
         button:disabled { opacity: .58 !important; cursor: not-allowed !important; }
         .st-key-chat-heading,
         .st-key-chat-controls,
-        .st-key-complaint-chat-history {
+        .st-key-complaint-chat-history,
+        .st-key-chat-composer {
             max-width: 800px;
             margin-left: auto;
             margin-right: auto;
         }
+        .st-key-chat-composer { margin-top: 4px; }
         .st-key-chat-controls { margin-top: 4px; margin-bottom: 12px; }
         .st-key-chat-controls [data-testid="stButton"] > button {
             min-height: 34px;
@@ -310,7 +384,7 @@ def apply_custom_styles() -> None:
             border: 0 !important;
             border-radius: 0 !important;
             padding: 0 !important;
-            margin: 0 0 16px !important;
+            margin: 0 0 10px !important;
             box-shadow: none !important;
         }
         .st-key-complaint-chat-history [data-testid="stChatMessageAvatarAssistant"],
@@ -352,10 +426,16 @@ def apply_custom_styles() -> None:
         [data-testid="stBottomBlockContainer"] {
             box-sizing: border-box;
             width: 100% !important;
-            max-width: 840px !important;
+            max-width: 800px !important;
             margin-left: auto !important;
             margin-right: auto !important;
             padding: 0 16px 12px !important;
+        }
+        .st-key-guided-complaint-form,
+        .st-key-guided-form-feedback {
+            max-width: 860px;
+            margin-left: auto;
+            margin-right: auto;
         }
         [data-testid="stChatInput"] {
             background: var(--ivory) !important;
@@ -517,7 +597,7 @@ def apply_custom_styles() -> None:
 
 def render_top_navbar() -> None:
     """Renders the top navigation header with clean public-service actions."""
-    auth_user = st.session_state.get("auth_user")
+    auth_user = _current_user()
 
     with st.container(key="top-navbar"):
         if auth_user:
@@ -526,8 +606,8 @@ def render_top_navbar() -> None:
                 vertical_alignment="center",
             )
         else:
-            nav_c1, nav_c2, nav_c3 = st.columns(
-                [5.2, 1.35, 1.15],
+            nav_c1, nav_c2, nav_c3, nav_c4 = st.columns(
+                [4.6, 1.25, 1.05, 1.3],
                 vertical_alignment="center",
             )
 
@@ -559,13 +639,11 @@ def render_top_navbar() -> None:
 
         with nav_c3:
             if not auth_user:
-                if st.button(
-                    "Sign in",
-                    type="primary",
-                    use_container_width=True,
-                    key="navbar_sign_in",
-                ):
-                    navigate_to("auth_login")
+                _render_html(
+                    '<a class="auth-gateway-link" href="/auth/login" '
+                    'target="_self">'
+                    "Sign In</a>",
+                )
             else:
                 role_title = auth_user["role"].title()
                 if st.button(
@@ -583,13 +661,17 @@ def render_top_navbar() -> None:
 
         if auth_user:
             with nav_c4:
-                if st.button(
-                    "Sign out",
-                    use_container_width=True,
-                    key="navbar_sign_out",
-                ):
-                    st.session_state["auth_user"] = None
-                    navigate_to("landing")
+                _render_html(
+                    '<a class="auth-sign-out-link" href="/auth/logout">'
+                    "Sign out</a>",
+                )
+        else:
+            with nav_c4:
+                _render_html(
+                    '<a class="auth-gateway-link secondary" '
+                    'href="/auth/signup" target="_self">'
+                    "Create Account</a>",
+                )
 
 
 # ==============================================================================
@@ -1114,7 +1196,7 @@ def render_landing_page() -> None:
                     <div class="draft-float-label">After submission</div>
                     <div class="draft-float-title">Malayalam FIR draft</div>
                     <div class="draft-float-status">Pending police review</div>
-                    <div class="draft-float-copy">A demonstration draft based on submitted details, reviewed by a person before approval.</div>
+                    <div class="draft-float-copy">Prepared from submitted details using a fixed template; reviewed before approval.</div>
                 </div>
             </div>
             """,
@@ -1173,10 +1255,10 @@ def render_landing_page() -> None:
     _render_html(
         """
         <div class="legal-note">
-            <strong>Important:</strong> This platform assists with
-            complaint intake and FIR preparation. A generated draft
-            is not an official FIR until it has been reviewed and
-            formally approved by authorized police personnel.
+            <strong>Research and evaluation:</strong> This application
+            supports complaint intake and FIR draft preparation. Submissions
+            are not transmitted to external police systems, and an approved
+            draft is not an officially registered FIR.
             <br><br>
             If someone is in immediate danger, contact the appropriate
             emergency service or local police directly. This platform
@@ -1196,63 +1278,82 @@ LANGUAGES = {
     "हिन्दी": "hi",
 }
 
-LANGUAGE_LABELS = {
-    "en": {
-        "title": "Choose your language",
-        "subtitle": "Select the language you are most comfortable using.",
-        "continue": "Continue",
-        "back": "Back",
-    },
-    "ml": {
-        "title": "നിങ്ങളുടെ ഭാഷ തിരഞ്ഞെടുക്കുക",
-        "subtitle": "നിങ്ങൾക്ക് സൗകര്യപ്രദമായ ഭാഷ തിരഞ്ഞെടുക്കുക.",
-        "continue": "തുടരുക",
-        "back": "തിരികെ",
-    },
-    "hi": {
-        "title": "अपनी भाषा चुनें",
-        "subtitle": "वह भाषा चुनें जिसमें आप सहज महसूस करते हैं।",
-        "continue": "जारी रखें",
-        "back": "वापस",
-    },
-}
+LANGUAGE_LABELS = LANGUAGES
 
 
 def render_language_select() -> None:
     """Lets the citizen select their preferred intake language."""
-    st.markdown("## Choose your language")
-    st.write("Select the language you are most comfortable using.")
-
-    language_options = list(LANGUAGES.keys())
+    current_language = st.session_state.get("selected_language", "en")
+    language_change_from = st.session_state.get("language_change_from")
+    language_options = list(LANGUAGE_LABELS)
+    current_label = next(
+        (label for label, code in LANGUAGE_LABELS.items() if code == current_language),
+        language_options[0],
+    )
+    current_index = language_options.index(current_label)
     selected = st.radio(
-        "Preferred language",
+        translate("language.label", current_language),
         language_options,
+        index=current_index,
         horizontal=True,
         label_visibility="collapsed",
     )
+    selected_language = LANGUAGE_LABELS.get(selected, "en")
+    st.markdown(f"## {translate('language.title', selected_language)}")
+    st.write(translate("language.subtitle", selected_language))
 
-    if st.button("Continue", type="primary", use_container_width=True):
-        lang_code = LANGUAGES[selected]
+    if st.button(
+        translate("continue", selected_language),
+        type="primary",
+        use_container_width=True,
+    ):
+        lang_code = selected_language
         st.session_state["selected_language"] = lang_code
-        st.session_state["complaint_slots"] = create_empty_complaint_slots(
-            lang_code
-        )
-        st.session_state["chat_messages"] = []
-        st.session_state["chat_step_index"] = 0
-        navigate_to("complaint_chat")
+        slots = _get_complaint_slots()
+        slots["language"] = lang_code
+        st.session_state["complaint_slots"] = slots
 
-    if st.button("Back", use_container_width=True):
-        navigate_to("landing")
+        if language_change_from:
+            old_messages = st.session_state.get("chat_messages", [])
+            user_answers = [
+                message.get("content", "")
+                for message in old_messages
+                if message.get("role") == "user"
+            ]
+            step_index = int(st.session_state.get("chat_step_index", 0))
+            rebuilt_messages = []
+            for index, answer in enumerate(user_answers[:step_index]):
+                step = CHAT_STEPS[index]
+                rebuilt_messages.append(
+                    {"role": "assistant", "content": conversation_prompt(step, lang_code)}
+                )
+                # Preserve the citizen's original answer exactly as entered.
+                rebuilt_messages.append({"role": "user", "content": answer})
+            st.session_state["chat_messages"] = rebuilt_messages
+            st.session_state.pop("language_change_from", None)
+            navigate_to(language_change_from)
+        else:
+            if "complaint_slots" not in st.session_state:
+                st.session_state["complaint_slots"] = create_empty_complaint_slots(
+                    lang_code
+                )
+            st.session_state["chat_messages"] = []
+            st.session_state["chat_step_index"] = 0
+            navigate_to("complaint_chat")
+
+    if st.button(translate("back", selected_language), use_container_width=True):
+        st.session_state.pop("language_change_from", None)
+        navigate_to(language_change_from or "landing")
 
 
 # ==============================================================================
 # COMPLAINT INTAKE HELPERS
 # ==============================================================================
 
-def _get_language_text(en: str, ml: str, hi: str) -> str:
-    """Returns a translated string for the selected language."""
+def _t(key: str, **values: Any) -> str:
+    """Returns a citizen-facing translation for the current intake language."""
     lang = st.session_state.get("selected_language", "en")
-    return {"en": en, "ml": ml, "hi": hi}.get(lang, en)
+    return translate(key, lang, **values)
 
 
 def _safe_display(value: Any) -> str:
@@ -1399,26 +1500,21 @@ def render_complaint_chat() -> None:
     steps = _get_chat_steps()
 
     with st.container(key="chat-heading"):
-        st.markdown("## Tell us what happened")
-        st.write(
-            _get_language_text(
-                "Answer the questions below. You can review your information before submitting.",
-                "താഴെയുള്ള ചോദ്യങ്ങൾക്ക് ഉത്തരം നൽകുക. സമർപ്പിക്കുന്നതിന് മുമ്പ് വിവരങ്ങൾ പരിശോധിക്കാം.",
-                "नीचे दिए गए प्रश्नों के उत्तर दें। जमा करने से पहले आप जानकारी की समीक्षा कर सकते हैं।",
-            )
-        )
+        st.markdown(f"## {_t('chat.title')}")
+        st.write(_t("chat.instructions"))
 
     with st.container(key="chat-controls", horizontal=True, gap="small"):
         if st.button(
-            "Change language",
+            _t("chat.change_language"),
             key="chat_change_language",
             type="tertiary",
             width="content",
         ):
+            st.session_state["language_change_from"] = "complaint_chat"
             navigate_to("language_select")
 
         if st.button(
-            "Use guided form instead",
+            _t("chat.use_form"),
             key="chat_use_guided_form",
             type="tertiary",
             width="content",
@@ -1426,7 +1522,7 @@ def render_complaint_chat() -> None:
             navigate_to("complaint_guided_form")
 
         if st.button(
-            "Start over",
+            _t("chat.start_over"),
             key="chat_start_over",
             type="tertiary",
             width="content",
@@ -1435,11 +1531,8 @@ def render_complaint_chat() -> None:
             st.rerun()
 
     if not steps:
-        st.warning(
-            "The conversational intake steps are not configured. "
-            "You can use the guided form instead."
-        )
-        if st.button("Open guided complaint form", type="primary"):
+        st.warning(_t("chat.steps_missing"))
+        if st.button(_t("chat.open_form"), type="primary"):
             navigate_to("complaint_guided_form")
         return
 
@@ -1465,27 +1558,42 @@ def render_complaint_chat() -> None:
                 with st.chat_message("assistant"):
                     st.markdown(prompt)
 
+            if key == "category":
+                category_labels = [
+                    f"{index}. {translate_category(category, lang)}"
+                    for index, category in enumerate(COMPLAINT_CATEGORIES[1:], start=1)
+                ]
+                st.caption(_t("chat.categories_intro"))
+                st.write("\n".join(category_labels))
+
     if step_index < len(steps):
-        answer = st.chat_input(
-            _get_language_text(
-                "Type your answer...",
-                "നിങ്ങളുടെ ഉത്തരം എഴുതുക...",
-                "अपना उत्तर लिखें...",
-            ),
-            key=f"chat_answer_{step_index}",
-        )
+        with st.container(key="chat-composer"):
+            answer = st.chat_input(
+                _t("chat.answer_placeholder"),
+                key=f"chat_answer_{step_index}",
+            )
 
         if answer is not None:
             answer = answer.strip()
 
             if not answer:
-                st.warning("Please enter an answer before continuing.")
+                st.warning(_t("chat.empty_answer"))
                 st.rerun()
 
-            valid, message, slot_updates = _validate_step(key, answer)
+            validation_answer = (
+                category_value_from_label(answer, lang)
+                if key == "category"
+                else None
+            ) or answer
+            valid, message, slot_updates = _validate_step(key, validation_answer)
 
             if not valid:
-                st.error(message or "Please check your answer and try again.")
+                st.error(
+                    translate_validation_message(
+                        message or _t("chat.general_error"),
+                        lang,
+                    )
+                )
                 st.stop()
 
             slots.update(slot_updates)
@@ -1496,9 +1604,9 @@ def render_complaint_chat() -> None:
             st.session_state["chat_step_index"] = step_index + 1
             st.rerun()
     else:
-        st.success("You have completed the guided questions.")
+        st.success(_t("chat.complete"))
 
-        if st.button("Review my complaint", type="primary"):
+        if st.button(_t("chat.review"), type="primary"):
             navigate_to("complaint_verify")
 
 
@@ -1509,98 +1617,115 @@ def render_complaint_chat() -> None:
 def render_guided_form() -> None:
     """Provides a conventional form as a fallback to conversational intake."""
     slots = _get_complaint_slots()
+    lang = st.session_state.get("selected_language", "en")
 
-    st.markdown("## Complaint details")
-    st.write(
-        "Complete the information you know. If a field does not apply, "
-        "leave it blank where permitted."
-    )
+    st.markdown(f"## {_t('form.title')}")
+    st.write(_t("form.instructions"))
 
-    with st.form("guided_complaint_form"):
-        name = st.text_input(
-            "Complainant name",
-            value=str(slots.get("name", "")),
-        )
-        contact_number = st.text_input(
-            "Contact number",
-            value=str(slots.get("contact_number", "")),
-        )
-
-        categories = list(COMPLAINT_CATEGORIES)
-        if not categories:
-            categories = ["Other"]
-
-        current_category = str(slots.get("category", ""))
-        category_index = (
-            categories.index(current_category)
-            if current_category in categories
-            else 0
-        )
-
-        category = st.selectbox(
-            "Complaint category",
-            categories,
-            index=category_index,
-        )
-
-        saved_incident_date = str(slots.get("incident_date", "")).strip()
-        incident_date_unknown = st.checkbox(
-            "Incident date is unknown",
-            value=(
-                not bool(saved_incident_date)
-                or saved_incident_date.casefold() == "unknown"
-            ),
-        )
-
-        incident_date_default: Any = saved_incident_date
-        try:
-            if isinstance(incident_date_default, str):
-                incident_date_default = date.fromisoformat(
-                    incident_date_default
-                )
-        except ValueError:
-            incident_date_default = date.today()
-
-        if not isinstance(incident_date_default, date):
-            incident_date_default = date.today()
-
-        incident_date_value = "Unknown"
-        if not incident_date_unknown:
-            selected_incident_date = st.date_input(
-                "Incident date",
-                value=incident_date_default,
-                max_value=date.today(),
+    with st.container(key="guided-complaint-form"):
+        with st.form("guided_complaint_form"):
+            st.markdown(f"### {_t('form.complainant_section')}")
+            name = st.text_input(
+                _t("field.name"),
+                value=str(slots.get("name", "")),
             )
-            incident_date_value = selected_incident_date.isoformat()
+            contact_number = st.text_input(
+                _t("field.contact"),
+                value=str(slots.get("contact_number", "")),
+            )
 
-        incident_time = st.text_input(
-            "Approximate incident time (optional)",
-            value=str(slots.get("incident_time", "")),
-        )
+            st.markdown(f"### {_t('form.incident_section')}")
+            categories = list(COMPLAINT_CATEGORIES)
+            if not categories:
+                categories = ["Other"]
 
-        location = st.text_input(
-            "Incident location",
-            value=str(slots.get("location", "")),
-        )
+            current_category = str(slots.get("category", ""))
+            category_index = (
+                categories.index(current_category)
+                if current_category in categories
+                else 0
+            )
 
-        description = st.text_area(
-            "Describe what happened",
-            value=str(slots.get("description", "")),
-            height=180,
-        )
+            category = st.selectbox(
+                _t("field.category"),
+                categories,
+                index=category_index,
+                format_func=lambda value: translate_category(value, lang),
+            )
 
-        additional_info = st.text_area(
-            "Additional information (optional)",
-            value=str(slots.get("additional_info", "")),
-        )
+            saved_incident_date = str(slots.get("incident_date", "")).strip()
+            incident_date_unknown = st.checkbox(
+                _t("field.date_unknown"),
+                value=(
+                    not bool(saved_incident_date)
+                    or saved_incident_date.casefold() == "unknown"
+                ),
+            )
 
-        submitted = st.form_submit_button(
-            "Review complaint",
-            type="primary",
-            use_container_width=True,
-        )
+            incident_date_default: Any = saved_incident_date
+            try:
+                if isinstance(incident_date_default, str):
+                    incident_date_default = date.fromisoformat(
+                        incident_date_default
+                    )
+            except ValueError:
+                incident_date_default = date.today()
 
-    if submitted:
+            if not isinstance(incident_date_default, date):
+                incident_date_default = date.today()
+
+            incident_date_value = "Unknown"
+            if not incident_date_unknown:
+                selected_incident_date = st.date_input(
+                    _t("field.date"),
+                    value=incident_date_default,
+                    max_value=date.today(),
+                )
+                incident_date_value = selected_incident_date.isoformat()
+
+            incident_time = st.text_input(
+                _t("field.time"),
+                value=str(slots.get("incident_time", "")),
+            )
+
+            location = st.text_input(
+                _t("field.location"),
+                value=str(slots.get("location", "")),
+            )
+
+            st.markdown(f"### {_t('form.description_section')}")
+            description = st.text_area(
+                _t("field.description"),
+                value=str(slots.get("description", "")),
+                height=180,
+            )
+
+            additional_info = st.text_area(
+                _t("field.additional"),
+                value=str(slots.get("additional_info", "")),
+            )
+
+            review_column, back_column, language_column = st.columns(3)
+            with review_column:
+                submitted = st.form_submit_button(
+                    _t("form.review"),
+                    type="primary",
+                    use_container_width=True,
+                )
+            with back_column:
+                back_to_chat = st.form_submit_button(
+                    _t("form.back_chat"),
+                    type="secondary",
+                    use_container_width=True,
+                )
+            with language_column:
+                change_language = st.form_submit_button(
+                    _t("form.change_language"),
+                    type="secondary",
+                    use_container_width=True,
+                )
+
+    if submitted or back_to_chat or change_language:
         updated = {
             "name": name.strip(),
             "contact_number": contact_number.strip(),
@@ -1615,6 +1740,15 @@ def render_guided_form() -> None:
         slots.update(updated)
         st.session_state["complaint_slots"] = slots
 
+        if back_to_chat:
+            navigate_to("complaint_chat")
+            return
+
+        if change_language:
+            st.session_state["language_change_from"] = "complaint_guided_form"
+            navigate_to("language_select")
+            return
+
         valid, errors = validate_complaint_input(
             name=slots.get("name", ""),
             contact_number=slots.get("contact_number", ""),
@@ -1625,13 +1759,12 @@ def render_guided_form() -> None:
             additional_info=slots.get("additional_info", ""),
         )
         if not valid:
-            for message in errors.values():
-                st.error(message)
+            with st.container(key="guided-form-feedback"):
+                st.markdown(f"**{_t('form.feedback_title')}**")
+                for message in errors.values():
+                    st.error(translate_validation_message(message, lang))
         else:
             navigate_to("complaint_verify")
-
-    if st.button("← Back to conversation"):
-        navigate_to("complaint_chat")
 
 
 # ==============================================================================
@@ -1641,53 +1774,87 @@ def render_guided_form() -> None:
 def render_complaint_verify() -> None:
     """Displays complaint information for citizen verification."""
     slots = _get_complaint_slots()
+    lang = st.session_state.get("selected_language", "en")
 
-    st.markdown("## Review your complaint")
-    st.write(
-        "Check each detail carefully. You can go back and correct "
-        "any information before submitting."
-    )
+    st.markdown(f"## {_t('review.title')}")
+    st.caption(_t("review.caption"))
 
-    display_fields = [
-        ("name", "Complainant name"),
-        ("contact_number", "Contact number"),
-        ("category", "Complaint category"),
-        ("incident_date", "Incident date"),
-        ("incident_time", "Incident time"),
-        ("location", "Incident location"),
-        ("description", "Incident description"),
-        ("additional_info", "Additional information"),
+    section_groups = [
+        (
+            "review.section_complainant",
+            [
+                ("name", "review.name"),
+                ("contact_number", "review.contact"),
+            ],
+        ),
+        (
+            "review.section_incident",
+            [
+                ("category", "review.category"),
+                ("incident_date", "review.date"),
+                ("incident_time", "review.time"),
+                ("location", "review.location"),
+            ],
+        ),
+        (
+            "review.section_description",
+            [
+                ("description", "review.description"),
+                ("additional_info", "review.additional"),
+            ],
+        ),
     ]
 
     with st.container(border=True):
-        for key, label in display_fields:
-            value = _display_value(slots.get(key))
-            st.markdown(f"**{label}:**")
-            st.write(value)
+        for section_title, fields in section_groups:
+            st.markdown(f"### {_t(section_title)}")
+            for key, label_key in fields:
+                value = _display_value(
+                    slots.get(key),
+                    fallback=_t("review.not_provided"),
+                )
+                if key == "category":
+                    value = translate_category(value, lang)
+                elif key == "incident_date" and value.casefold() == "unknown":
+                    value = _t("review.unknown")
+                st.markdown(f"**{_t(label_key)}:**")
+                st.write(value)
+            st.markdown("---")
 
-    col1, col2 = st.columns(2)
+    st.markdown(f"### {_t('review.section_actions')}")
+    col1, col2, col3 = st.columns([1.05, 1.2, 1.05])
 
     with col1:
-        if st.button("Edit complaint", use_container_width=True):
+        if st.button(_t("review.edit"), type="secondary", use_container_width=True):
             st.session_state["complaint_submission_completed"] = False
             navigate_to("complaint_guided_form")
 
     with col2:
         if st.button(
-            "Submit complaint",
+            _t("review.submit"),
             type="primary",
             use_container_width=True,
         ):
             _submit_complaint(slots)
 
+    with col3:
+        if st.button(
+            _t("review.cancel"),
+            type="secondary",
+            use_container_width=True,
+        ):
+            reset_intake()
+            navigate_to("landing")
+
 
 def _submit_complaint(slots: Dict[str, Any]) -> None:
     """Validates and stores a complaint using the database module."""
+    lang = st.session_state.get("selected_language", "en")
     if st.session_state.get("complaint_submission_completed"):
         if st.session_state.get("last_submitted_ref"):
             navigate_to("complaint_confirmed")
             return
-        st.error("This complaint has already been submitted.")
+        st.error(_t("submit.duplicate"))
         return
 
     valid, errors = validate_complaint_input(
@@ -1702,7 +1869,7 @@ def _submit_complaint(slots: Dict[str, Any]) -> None:
 
     if not valid:
         for message in errors.values():
-            st.error(message)
+            st.error(translate_validation_message(message, lang))
         return
 
     user = _current_user()
@@ -1736,12 +1903,13 @@ def _submit_complaint(slots: Dict[str, Any]) -> None:
             draft_content_ml=draft,
             recovery_handle_hash=recovery_handle_hash,
         )
-    except sqlite3.Error as exc:
-        st.error(_safe_error_message(exc))
+    except (sqlite3.Error, database.AuthorizationError) as exc:
+        _LOGGER.exception("Complaint submission failed.")
+        st.error(_t("submit.unavailable"))
         return
 
     if not success or not record.get("reference_no"):
-        st.error(message or "The complaint could not be saved. Please try again.")
+        st.error(_t("submit.failed"))
         return
 
     st.session_state["last_submitted_ref"] = record["reference_no"]
@@ -1798,6 +1966,7 @@ def _send_confirmation_code(
 
 def render_complaint_confirmed() -> None:
     """Shows the reference number for a successfully submitted complaint."""
+    lang = st.session_state.get("selected_language", "en")
     clear_otp = st.session_state.pop("confirmation_otp_clear_pending", False)
     if st.session_state.get("confirmation_verified_handle") or clear_otp:
         st.session_state.pop("confirmation_otp", None)
@@ -1826,8 +1995,9 @@ def render_complaint_confirmed() -> None:
         handle_hash = otp_service.hash_recovery_handle(requested_handle)
         try:
             challenge = database.get_recovery_challenge(handle_hash)
-        except sqlite3.Error as exc:
-            st.error(_safe_error_message(exc))
+        except (sqlite3.Error, database.AuthorizationError):
+            _LOGGER.exception("Complaint confirmation could not be retrieved.")
+            st.error(_t("confirm.service_unavailable"))
 
         if challenge:
             recovery_expires_at = challenge.get("recovery_expires_at")
@@ -1852,27 +2022,27 @@ def render_complaint_confirmed() -> None:
             if same_submission or verified_in_session:
                 reference = challenge["reference_no"]
 
-    st.markdown("## Complaint submitted")
+    st.markdown(f"## {_t('confirm.title')}")
+    st.info(_t("confirm.disclaimer"))
     if verification_feedback:
-        st.error(verification_feedback)
+        st.error(translate_feedback(verification_feedback, lang))
 
     if reference:
-        st.success("Your complaint has been recorded.")
-        st.markdown("### Your reference number")
+        st.success(_t("confirm.success"))
+        st.markdown(f"### {_t('confirm.reference_title')}")
         st.code(str(reference))
-        st.write(
-            "Keep this reference number safe. You may need it to check "
-            "the status of your complaint."
-        )
+        st.write(_t("confirm.reference_help"))
+        st.caption(_t("confirm.account_help"))
     else:
         if challenge and handle_hash:
-            st.write(
-                "To recover this confirmation, verify the one-time code sent "
-                "to the phone number used for the complaint."
-            )
+            st.write(_t("confirm.recovery_help"))
             st.caption(
-                f"Recovery messages go to "
-                f"{otp_service.mask_phone_number(challenge['contact_number'])}."
+                _t(
+                    "confirm.recovery_phone",
+                    phone=otp_service.mask_phone_number(
+                        challenge["contact_number"]
+                    ),
+                )
             )
 
             locked_until = challenge.get("locked_until")
@@ -1896,12 +2066,12 @@ def render_complaint_confirmed() -> None:
 
                 with st.form("send_confirmation_code_form"):
                     send_submitted = st.form_submit_button(
-                        "Send or resend code",
+                        _t("confirm.send_code"),
                         type="secondary",
                         disabled=cooldown_active,
                     )
                 if cooldown_active:
-                    st.caption("Please wait before requesting another code.")
+                    st.caption(_t("confirm.wait_code"))
 
                 if send_submitted:
                     try:
@@ -1910,48 +2080,33 @@ def render_complaint_confirmed() -> None:
                             challenge,
                         )
                     except (ValueError, SmsProviderError) as exc:
-                        st.error(str(exc))
-                    except sqlite3.Error as exc:
-                        st.error(_safe_error_message(exc))
+                        _LOGGER.warning("Confirmation code delivery failed: %s", type(exc).__name__)
+                        st.error(_t("confirm.sms_unavailable"))
+                    except (sqlite3.Error, database.AuthorizationError):
+                        _LOGGER.exception("Confirmation code request failed.")
+                        st.error(_t("confirm.service_unavailable"))
                     else:
                         if send_status == "sent":
-                            st.success(
-                                "A verification code was sent to the saved "
-                                "phone number."
-                            )
+                            st.success(_t("confirm.code_sent"))
                             st.rerun()
                         elif send_status == "cooldown":
-                            st.warning(
-                                "Please wait before requesting another code."
-                            )
+                            st.warning(_t("confirm.wait_code"))
                         elif send_status == "rate_limited":
-                            st.error(
-                                "Too many code requests. Try again later."
-                            )
+                            st.error(_t("confirm.too_many_codes"))
                         elif send_status == "locked":
-                            st.error(
-                                "Verification is temporarily locked. Try again later."
-                            )
+                            st.error(_t("confirm.locked"))
                         elif send_status == "already_verified":
-                            st.error(
-                                "Request a new verification code to recover "
-                                "this confirmation."
-                            )
+                            st.error(_t("confirm.request_new_code"))
                         elif send_status in {"handle_expired", "revoked"}:
-                            st.warning(
-                                "This recovery link has expired or is no "
-                                "longer available. Start a new complaint if "
-                                "you need another confirmation link."
-                            )
+                            st.warning(_t("confirm.recovery_expired"))
                         else:
-                            st.error(
-                                "This recovery link is no longer available."
-                            )
+                            st.error(_t("confirm.recovery_unavailable"))
 
                 try:
                     challenge = database.get_recovery_challenge(handle_hash)
-                except sqlite3.Error as exc:
-                    st.error(_safe_error_message(exc))
+                except (sqlite3.Error, database.AuthorizationError):
+                    _LOGGER.exception("Complaint confirmation could not be retrieved.")
+                    st.error(_t("confirm.service_unavailable"))
                     challenge = None
                 if (
                     challenge
@@ -1962,12 +2117,12 @@ def render_complaint_confirmed() -> None:
                 ):
                     with st.form("verify_confirmation_code_form"):
                         code = st.text_input(
-                            "Six-digit SMS code",
+                            _t("confirm.code_label"),
                             max_chars=otp_service.OTP_LENGTH,
                             key="confirmation_otp",
                         )
                         verify_submitted = st.form_submit_button(
-                            "Verify code",
+                            _t("confirm.verify_code"),
                             type="primary",
                         )
                     if verify_submitted:
@@ -1985,11 +2140,11 @@ def render_complaint_confirmed() -> None:
                                 max_attempts=otp_service.OTP_MAX_ATTEMPTS,
                                 lockout_seconds=otp_service.OTP_LOCKOUT_SECONDS,
                             )
-                        except ValueError as exc:
-                            verification_feedback = str(exc)
+                        except ValueError:
+                            verification_feedback = _t("confirm.service_unavailable")
                             verify_status = "configuration_error"
-                        except sqlite3.Error as exc:
-                            verification_feedback = _safe_error_message(exc)
+                        except (sqlite3.Error, database.AuthorizationError):
+                            verification_feedback = _t("confirm.service_unavailable")
                             verify_status = "database_error"
                         if verify_status == "verified":
                             st.session_state[
@@ -1997,38 +2152,20 @@ def render_complaint_confirmed() -> None:
                             ] = handle_hash
                             st.rerun()
                         if verify_status == "locked":
-                            verification_feedback = (
-                                "Too many incorrect codes. Verification is "
-                                "temporarily locked."
-                            )
+                            verification_feedback = _t("confirm.too_many_incorrect")
                         elif verify_status == "expired":
-                            verification_feedback = (
-                                "That code expired. Request a new code to continue."
-                            )
+                            verification_feedback = _t("confirm.code_expired")
                         elif verify_status in {"handle_expired", "revoked"}:
-                            verification_feedback = (
-                                "This recovery link has expired or is no "
-                                "longer available. Start a new complaint if "
-                                "you need another confirmation link."
-                            )
+                            verification_feedback = _t("confirm.recovery_expired")
                         elif verify_status == "invalid":
-                            verification_feedback = (
-                                "That code could not be verified. Check it "
-                                "and try again."
-                            )
+                            verification_feedback = _t("confirm.code_invalid")
                         elif verify_status == "already_verified":
-                            verification_feedback = (
-                                "That code has already been used. Request a "
-                                "new code to continue."
-                            )
+                            verification_feedback = _t("confirm.code_used")
                         elif verify_status not in {
                             "configuration_error",
                             "database_error",
                         }:
-                            verification_feedback = (
-                                "That code could not be verified. Check it "
-                                "and try again."
-                            )
+                            verification_feedback = _t("confirm.code_invalid")
                         if verification_feedback:
                             st.session_state[
                                 "confirmation_otp_feedback"
@@ -2038,30 +2175,26 @@ def render_complaint_confirmed() -> None:
                             ] = True
                             st.rerun()
             elif locked:
-                st.error(
-                    "Too many incorrect codes. Verification is temporarily locked."
-                )
+                st.error(_t("confirm.too_many_incorrect"))
         else:
-            st.warning(
-                "This confirmation cannot be verified. Use complaint tracking "
-                "with your reference and contact number, or return home to "
-                "start a new complaint."
-            )
+            st.warning(_t("confirm.cannot_verify"))
 
-    st.info(
-        "Submitting a complaint through this platform does not itself mean "
-        "that an official FIR has been registered. Police review and formal "
-        "approval are separate steps."
-    )
-
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns([1.2, 1.2, 1.2])
 
     with col1:
-        if st.button("Track complaint", type="primary", use_container_width=True):
-            navigate_to("auth_track")
+        _render_html(
+            f'<a class="auth-gateway-link" href="/auth/login" '
+            f'target="_self">{_t("confirm.sign_in")}</a> '
+            f'<a class="auth-gateway-link" href="/auth/signup" '
+            f'target="_self">{_t("confirm.create_account")}</a>'
+        )
 
     with col2:
-        if st.button("Return home", use_container_width=True):
+        if st.button(_t("confirm.track"), type="primary", use_container_width=True):
+            navigate_to("auth_track")
+
+    with col3:
+        if st.button(_t("confirm.return_home"), use_container_width=True):
             navigate_to("landing")
 
 
@@ -2070,8 +2203,15 @@ def render_complaint_confirmed() -> None:
 # ==============================================================================
 
 def _current_user() -> Optional[Dict[str, Any]]:
-    """Returns the authenticated user, if one exists."""
-    user = st.session_state.get("auth_user")
+    """Validates the request cookie and loads the user's current database role."""
+    try:
+        user = auth_sessions.current_user_from_cookies(st.context.cookies)
+    except sqlite3.Error:
+        st.error(
+            "Your sign-in could not be verified right now. Refresh the page "
+            "or try again later."
+        )
+        return None
     return user if isinstance(user, dict) else None
 
 
@@ -2081,8 +2221,10 @@ def _require_role(allowed_roles: List[str]) -> bool:
 
     if not user:
         st.warning("Please sign in to access this page.")
-        if st.button("Go to sign in"):
-            navigate_to("auth_login")
+        _render_html(
+            '<a class="auth-gateway-link" href="/auth/login" '
+            'target="_self">Go to sign in</a>'
+        )
         return False
 
     if user.get("role") not in allowed_roles:
@@ -2093,8 +2235,33 @@ def _require_role(allowed_roles: List[str]) -> bool:
 
 
 def _safe_error_message(error: Exception) -> str:
-    """Returns a restrained error message without exposing internals."""
-    return f"Unable to complete the request: {escape(str(error))}"
+    """Logs only an exception type and returns a path/record-safe message."""
+    _LOGGER.warning("Request failed (%s).", type(error).__name__)
+    return "Unable to complete the request right now. Please try again."
+
+
+def render_application_root() -> None:
+    """Routes a validated session from the root to its role dashboard."""
+    user = _current_user()
+    if user is None:
+        render_landing_page()
+        return
+
+    dashboard_by_role = {
+        "citizen": "citizen_dashboard",
+        "police": "police_dashboard",
+        "admin": "admin_dashboard",
+    }
+    dashboard = dashboard_by_role.get(user.get("role"))
+    if dashboard is None:
+        st.error("This account does not have an available dashboard.")
+        _render_html(
+            '<a class="auth-gateway-link" href="/auth/login" '
+            'target="_self">Return to sign in</a>'
+        )
+        return
+
+    navigate_to(dashboard)
 
 
 # ==============================================================================
@@ -2102,53 +2269,12 @@ def _safe_error_message(error: Exception) -> str:
 # ==============================================================================
 
 def render_auth_login() -> None:
-    """Renders the sign-in form."""
-    st.markdown("## Sign in")
-    st.write("Sign in with the email address registered to your account.")
-
-    with st.form("login_form"):
-        email = st.text_input("Email address")
-        password = st.text_input("Password", type="password")
-
-        submitted = st.form_submit_button(
-            "Sign in",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submitted:
-        if not email.strip() or not password:
-            st.error("Enter both your email address and password.")
-        else:
-            try:
-                success, message, user = database.authenticate_user(
-                    email=email,
-                    password=password,
-                )
-            except sqlite3.Error as exc:
-                st.error(_safe_error_message(exc))
-            else:
-                if success and user:
-                    st.session_state["auth_user"] = user
-                    st.success("Signed in successfully.")
-                    destinations = {
-                        "citizen": "citizen_dashboard",
-                        "police": "police_dashboard",
-                        "admin": "admin_dashboard",
-                    }
-                    navigate_to(destinations[user["role"]])
-                else:
-                    st.error(message)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("Create account", use_container_width=True):
-            navigate_to("auth_signup")
-
-    with col2:
-        if st.button("Back home", use_container_width=True):
-            navigate_to("landing")
+    """Redirects the Streamlit login route to the same-origin auth gateway."""
+    _render_html(
+        '<meta http-equiv="refresh" content="0;url=/auth/login">'
+        '<p>Opening the sign-in form…</p>'
+        '<p><a href="/auth/login" target="_self">Continue to sign in</a></p>'
+    )
 
 
 # ==============================================================================
@@ -2156,130 +2282,125 @@ def render_auth_login() -> None:
 # ==============================================================================
 
 def render_auth_signup() -> None:
-    """Renders citizen account registration."""
-    st.markdown("## Create an account")
-    st.write(
-        "Creating an account can help you track complaints and receive updates. "
-        "You can begin a complaint without creating an account first."
+    """Redirects the Streamlit registration route to the same-origin gateway."""
+    _render_html(
+        '<meta http-equiv="refresh" content="0;url=/auth/signup">'
+        '<p>Opening the account registration form…</p>'
+        '<p><a href="/auth/signup" target="_self">Continue to registration</a></p>'
     )
-
-    with st.form("signup_form"):
-        full_name = st.text_input("Full name")
-        phone = st.text_input("Phone number")
-        email = st.text_input("Email address")
-        password = st.text_input("Create a password", type="password")
-        confirm_password = st.text_input(
-            "Confirm password",
-            type="password",
-        )
-
-        submitted = st.form_submit_button(
-            "Create account",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if submitted:
-        if not all(
-            [
-                full_name.strip(),
-                phone.strip(),
-                email.strip(),
-                password,
-                confirm_password,
-            ]
-        ):
-            st.error("Complete all required fields.")
-        elif password != confirm_password:
-            st.error("The passwords do not match.")
-        elif len(password) < 8:
-            st.error("Use a password with at least 8 characters.")
-        else:
-            try:
-                success, message, user = database.create_user(
-                    email=email,
-                    full_name=full_name,
-                    password=password,
-                    contact_number=phone,
-                    role="citizen",
-                )
-            except sqlite3.Error as exc:
-                st.error(_safe_error_message(exc))
-            else:
-                if success and user:
-                    st.session_state["auth_user"] = user
-                    st.success(message)
-                    navigate_to("citizen_dashboard")
-                else:
-                    st.error(message)
-
-    if st.button("Back to sign in", use_container_width=True):
-        navigate_to("auth_login")
 
 
 # ==============================================================================
 # COMPLAINT TRACKING
 # ==============================================================================
 
-def render_auth_track() -> None:
-    """Allows a citizen to enter a complaint reference for tracking."""
-    st.markdown("## Track a complaint")
-    st.write(
-        "Enter the reference number and the contact number used when "
-        "submitting the complaint."
+def _trusted_public_lookup_client_address(
+    forwarded_for: Optional[str],
+    trust_proxy: bool,
+) -> str:
+    """Returns a proxy-provided client IP, or a shared fail-closed identity."""
+    if not trust_proxy or not forwarded_for:
+        return "unattributed-client"
+
+    # Caddy and the included Nginx config append the connecting peer to the
+    # right of X-Forwarded-For. Only the final value is used, so a client
+    # supplied value to the left cannot choose a fresh rate-limit bucket.
+    candidate = forwarded_for.rsplit(",", 1)[-1].strip()
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        return "unattributed-client"
+
+
+def _public_lookup_client_key() -> str:
+    """Builds a keyed digest from the trusted reverse-proxy client address."""
+    trust_proxy = (
+        os.environ.get("FIR_AUTH_TRUST_PROXY", "false").strip().lower()
+        == "true"
+    )
+    forwarded_for = None
+    if trust_proxy:
+        try:
+            forwarded_for = st.context.headers.get("X-Forwarded-For")
+        except (AttributeError, RuntimeError):
+            forwarded_for = None
+    address = _trusted_public_lookup_client_address(
+        forwarded_for,
+        trust_proxy,
+    )
+    return otp_service.hash_public_lookup_client(
+        otp_service.get_otp_secret(),
+        address,
     )
 
+
+def render_auth_track() -> None:
+    """Allows a citizen to enter a complaint reference for tracking."""
+    st.markdown(f"## {_t('track.title')}")
+    st.write(_t("track.instructions"))
+
     with st.form("track_complaint_form"):
-        reference = st.text_input("Complaint reference number")
-        contact = st.text_input("Contact number used in the complaint")
+        reference = st.text_input(_t("track.reference"))
+        contact = st.text_input(_t("track.contact"))
 
         submitted = st.form_submit_button(
-            "Check status",
+            _t("track.check"),
             type="primary",
             use_container_width=True,
         )
 
     if submitted:
         if not reference.strip() or not contact.strip():
-            st.error("Enter both the complaint reference number and contact number.")
+            st.error(_t("track.required"))
         else:
             try:
-                complaint = database.get_complaint_by_reference(reference)
-            except sqlite3.Error as exc:
-                st.error(_safe_error_message(exc))
+                retry_after = database.reserve_public_complaint_lookup(
+                    _public_lookup_client_key()
+                )
+            except (sqlite3.Error, ValueError):
+                _LOGGER.exception(
+                    "Public complaint lookup limit could not be checked."
+                )
+                st.error(_t("track.unavailable"))
             else:
-                if (
-                    not complaint
-                    or database.re_clean_phone(complaint["contact_number"])
-                    != database.re_clean_phone(contact)
-                ):
+                if retry_after is not None:
                     st.error(
-                        "No complaint matched that reference number and contact number."
+                        _t("track.limited", seconds=retry_after)
                     )
                 else:
-                    user = _current_user()
-                    if user and user.get("role") == "citizen":
-                        try:
-                            linked, link_message = database.link_complaint_to_citizen(
-                                reference_no=complaint["reference_no"],
-                                contact_number=contact,
-                                citizen_user_id=user["id"],
-                            )
-                        except sqlite3.Error as exc:
-                            st.error(_safe_error_message(exc))
+                    try:
+                        complaint = database.get_complaint_by_reference(
+                            reference,
+                            contact,
+                        )
+                    except (sqlite3.Error, database.AuthorizationError):
+                        _LOGGER.exception("Public complaint status lookup failed.")
+                        st.error(_t("track.operation_failed"))
+                    else:
+                        if not complaint:
+                            st.error(_t("track.no_match"))
                         else:
-                            if linked:
-                                st.info(link_message)
-                    st.success("Complaint record found.")
-                    st.markdown(f"### {escape(complaint['reference_no'])}")
-                    st.write(f"Complaint status: {complaint['status']}")
-                    st.write(f"FIR draft status: {complaint['fir_status']}")
-                    st.caption(
-                        "This status is from the demonstration workflow and "
-                        "does not indicate official FIR registration."
-                    )
+                            user = _current_user()
+                            if user and user.get("role") == "citizen":
+                                try:
+                                    linked, link_message = database.link_complaint_to_citizen(
+                                        reference_no=complaint["reference_no"],
+                                        contact_number=contact,
+                                        citizen_user_id=user["id"],
+                                    )
+                                except (sqlite3.Error, database.AuthorizationError):
+                                    _LOGGER.exception("Complaint could not be linked to the signed-in citizen.")
+                                    st.error(_t("track.operation_failed"))
+                                else:
+                                    if linked:
+                                        st.info(_t("track.linked"))
+                            st.success(_t("track.found"))
+                            st.markdown(f"### {escape(complaint['reference_no'])}")
+                            st.write(f"{_t('track.complaint_status')}: {translate_status(complaint['status'], st.session_state.get('selected_language', 'en'))}")
+                            st.write(f"{_t('track.draft_status')}: {translate_status(complaint['fir_status'], st.session_state.get('selected_language', 'en'))}")
+                            st.caption(_t("track.notice"))
 
-    if st.button("Back home", use_container_width=True):
+    if st.button(_t("track.back"), use_container_width=True):
         navigate_to("landing")
 
 # ==============================================================================
@@ -2288,71 +2409,87 @@ def render_auth_track() -> None:
 
 def render_citizen_dashboard() -> None:
     """Displays the citizen's dashboard."""
+    lang = st.session_state.get("selected_language", "en")
     if not _require_role(["citizen"]):
         return
 
     user = _current_user()
     if user is None:
-        st.error("The signed-in citizen session is unavailable. Please sign in again.")
+        st.error(_t("dashboard.unavailable"))
         return
 
-    st.markdown("## My dashboard")
-    st.write(
-        f"Welcome, {escape(str(user.get('full_name', 'Citizen')))}."
-    )
-    if st.button("Refresh complaints"):
+    st.markdown(f"## {_t('dashboard.title')}")
+    st.write(_t("dashboard.welcome", name=escape(str(user.get("full_name", "Citizen")))))
+    if st.button(_t("dashboard.refresh")):
         st.rerun()
 
     try:
-        complaints = database.get_complaints_for_citizen(user["id"])
-    except sqlite3.Error as exc:
-        st.error(_safe_error_message(exc))
+        try:
+            complaints = database.get_complaints_for_citizen(
+                user["id"],
+                requesting_user_id=user["id"],
+            )
+        except database.AuthorizationError:
+            st.error(_t("dashboard.revoked"))
+            return
+    except (sqlite3.Error, database.AuthorizationError) as exc:
+        _LOGGER.exception("Citizen complaints could not be loaded.")
+        st.error(_t("dashboard.operation_failed"))
         complaints = []
 
     if not complaints:
-        st.info("No complaints are linked to this account yet.")
+        st.info(_t("dashboard.empty"))
     else:
-        st.markdown("### Your complaints")
+        st.markdown(f"### {_t('dashboard.complaints')}")
         for complaint in complaints:
             with st.container(border=True):
                 reference = str(complaint["reference_no"])
                 st.markdown(f"### {escape(reference)}")
-                st.write(f"Category: {complaint['category']}")
-                st.write(f"Incident date: {complaint['incident_date']}")
-                st.write(f"Incident location: {complaint['incident_location']}")
-                st.write(f"Complaint status: {complaint['status']}")
-                st.write(f"FIR draft status: {complaint['fir_status']}")
+                st.write(f"{_t('dashboard.category')}: {translate_category(complaint['category'], lang)}")
+                st.write(f"{_t('dashboard.date')}: {complaint['incident_date']}")
+                st.write(f"{_t('dashboard.location')}: {complaint['incident_location']}")
+                st.write(f"{_t('dashboard.complaint_status')}: {translate_status(complaint['status'], lang)}")
+                st.write(f"{_t('dashboard.draft_status')}: {translate_status(complaint['fir_status'], lang)}")
 
                 try:
-                    draft = database.get_latest_fir_draft(complaint["id"])
-                except sqlite3.Error as exc:
-                    st.error(_safe_error_message(exc))
+                    draft = database.get_latest_fir_draft(
+                        complaint["id"],
+                        actor_user_id=user["id"],
+                    )
+                except (sqlite3.Error, database.AuthorizationError):
+                    _LOGGER.exception("Citizen draft could not be loaded.")
+                    st.error(_t("dashboard.operation_failed"))
                     draft = None
 
                 if draft:
-                    st.caption(
-                        "Malayalam FIR Draft — Pending Human Review. "
-                        "Generated by a deterministic demonstration template, "
-                        "not an AI language model."
-                    )
-                    with st.expander("View Malayalam draft"):
+                    st.caption(_t("dashboard.template_notice"))
+                    with st.expander(_t("dashboard.view_draft")):
                         st.text(draft["draft_content_ml"])
 
-                    if complaint["is_approved"]:
+                    try:
+                        downloadable_draft = (
+                            database.get_approved_fir_draft_for_citizen(
+                                complaint_id=complaint["id"],
+                                citizen_user_id=user["id"],
+                            )
+                        )
+                    except (sqlite3.Error, database.AuthorizationError):
+                        _LOGGER.exception("Approved citizen draft could not be loaded.")
+                        st.error(_t("dashboard.operation_failed"))
+                        downloadable_draft = None
+
+                    if downloadable_draft:
                         st.download_button(
-                            "Download reviewed draft",
-                            data=draft["draft_content_ml"],
+                            _t("dashboard.download"),
+                            data=downloadable_draft["draft_content_ml"],
                             file_name=f"{reference}-fir-draft.txt",
                             mime="text/plain; charset=utf-8",
                             key=f"download_fir_{complaint['id']}",
                         )
                     else:
-                        st.info(
-                            "Draft download is available only after police "
-                            "approval in this demonstration workflow."
-                        )
+                        st.info(_t("dashboard.download_locked"))
 
-    if st.button("Submit another complaint", type="primary"):
+    if st.button(_t("dashboard.submit_another"), type="primary"):
         reset_intake()
         navigate_to("language_select")
 
@@ -2376,18 +2513,25 @@ def render_police_dashboard() -> None:
         "Review submitted complaints and update Malayalam FIR drafts."
     )
     st.caption(
-        "This prototype uses a demonstration police role. It does not "
-        "independently verify a reviewer's identity or authority."
+        "Reviewer identity and authority are not independently verified."
     )
 
     try:
-        cases = database.get_all_complaints_for_police()
-    except sqlite3.Error as exc:
+        cases = database.get_all_complaints_for_police(
+            police_user_id=reviewer["id"],
+        )
+    except (sqlite3.Error, database.AuthorizationError) as exc:
         st.error(_safe_error_message(exc))
         return
 
+    review_feedback = st.session_state.pop("police_review_feedback", None)
+    if review_feedback:
+        st.error(review_feedback)
+
     tab_queue, tab_case, tab_fir = st.tabs(
-        ["Complaint queue", "Case details", "FIR drafting"]
+        ["Complaint queue", "Case details", "FIR drafting"],
+        key="police_dashboard_tabs",
+        on_change="rerun",
     )
 
     with tab_queue:
@@ -2422,30 +2566,44 @@ def render_police_dashboard() -> None:
             selected_label = st.selectbox(
                 "Choose a complaint to inspect",
                 list(case_by_label),
+                index=None,
+                placeholder="Select a submitted complaint",
                 key="police_queue_selection",
             )
-            if st.button(
+            st.button(
                 "Inspect & Review",
                 type="primary",
                 key="inspect_police_case",
-            ):
-                st.session_state["active_police_case_id"] = case_by_label[
-                    selected_label
-                ]
-                st.rerun()
+                on_click=_open_police_case,
+                args=(case_by_label.get(selected_label),),
+            )
 
     case_id = st.session_state.get("active_police_case_id")
     active_case = None
+    case_lookup_failed = False
     if case_id is not None:
         try:
-            active_case = database.get_complaint_by_id(int(case_id))
-        except sqlite3.Error as exc:
+            active_case = database.get_complaint_by_id(
+                int(case_id),
+                actor_user_id=reviewer["id"],
+            )
+        except (sqlite3.Error, database.AuthorizationError) as exc:
             st.error(_safe_error_message(exc))
+            case_lookup_failed = True
+        if active_case is None and not case_lookup_failed:
+            st.session_state["active_police_case_id"] = None
+            st.error(
+                "The selected complaint could not be found. Select another "
+                "complaint from the queue."
+            )
 
     with tab_case:
         st.markdown("### Case details")
         if not active_case:
-            st.info("Select a complaint from the queue and choose Inspect & Review.")
+            st.info(
+                "Select a submitted complaint in the queue, then choose "
+                "Inspect & Review."
+            )
         else:
             _render_case_summary(active_case)
             st.markdown(f"**Complainant:** {escape(active_case['complainant_name'])}")
@@ -2470,23 +2628,48 @@ def render_police_dashboard() -> None:
     with tab_fir:
         st.markdown("### Malayalam FIR draft")
         if not active_case:
-            st.info("Select a complaint from the queue before reviewing its draft.")
+            st.info(
+                "Select a submitted complaint in the queue before reviewing "
+                "its draft."
+            )
         else:
             try:
-                draft = database.get_latest_fir_draft(active_case["id"])
-            except sqlite3.Error as exc:
+                draft = database.get_latest_fir_draft(
+                    active_case["id"],
+                    actor_user_id=reviewer["id"],
+                )
+            except (sqlite3.Error, database.AuthorizationError) as exc:
                 st.error(_safe_error_message(exc))
                 draft = None
 
             if not draft:
                 st.warning("No FIR draft is stored for this complaint.")
             else:
+                approval_feedback = st.session_state.get(
+                    "police_draft_action_feedback"
+                )
+                if (
+                    approval_feedback
+                    and approval_feedback.get("complaint_id")
+                    == active_case["id"]
+                ):
+                    st.error(approval_feedback["message"])
+
                 st.caption(
-                    "Malayalam FIR Draft — Pending Human Review. "
-                    "The current generator is a deterministic template, not an LLM."
+                    "Prepared from the submitted complaint using a fixed "
+                    "template; no AI model is used."
                 )
                 _render_html(_status_pill(draft["status"]))
                 st.write(f"Current draft status: {draft['status']}")
+                is_approved = (
+                    bool(active_case.get("is_approved"))
+                    and draft.get("status") == "Approved"
+                )
+                if is_approved:
+                    st.success(
+                        "Draft approved in this application's review process. "
+                        "This does not constitute official FIR registration."
+                    )
                 draft_text = st.text_area(
                     "Editable Malayalam FIR draft",
                     value=draft["draft_content_ml"],
@@ -2503,20 +2686,24 @@ def render_police_dashboard() -> None:
                     "I have reviewed the draft and its complaint facts.",
                     key=f"confirm_review_{active_case['id']}_{draft['id']}",
                 )
+                if not review_confirmed and not is_approved:
+                    st.caption(
+                        "Confirm your review before approving this draft."
+                    )
 
                 if st.button(
                     "Save Changes",
                     key=f"save_draft_{active_case['id']}",
                 ):
                     try:
-                        saved = database.update_fir_draft(
+                        saved = database.review_fir_draft(
                             complaint_id=active_case["id"],
-                            draft_content_ml=draft_text,
                             reviewer_user_id=reviewer_id,
+                            decision="save",
+                            draft_content_ml=draft_text,
                             reviewer_notes=reviewer_notes,
-                            status="Pending Police Approval",
                         )
-                    except sqlite3.Error as exc:
+                    except (sqlite3.Error, database.AuthorizationError) as exc:
                         st.error(_safe_error_message(exc))
                     else:
                         if saved:
@@ -2527,40 +2714,67 @@ def render_police_dashboard() -> None:
                 action_col1, action_col2 = st.columns(2)
                 with action_col1:
                     if st.button(
-                        "Approve FIR Draft",
+                        "FIR Draft Approved" if is_approved else "Approve FIR Draft",
                         type="primary",
-                        disabled=not review_confirmed,
+                        disabled=not review_confirmed or is_approved,
                         key=f"approve_draft_{active_case['id']}",
                     ):
+                        st.session_state.pop(
+                            "police_draft_action_feedback",
+                            None,
+                        )
                         try:
-                            saved = database.update_fir_draft(
+                            approved = database.review_fir_draft(
                                 complaint_id=active_case["id"],
-                                draft_content_ml=draft_text,
                                 reviewer_user_id=reviewer_id,
-                                reviewer_notes=reviewer_notes,
-                                status="Pending Police Approval",
+                                decision="approve",
+                                draft_content_ml=draft_text,
+                                reviewer_notes=reviewer_notes
+                                or "Approved in the application review process.",
                             )
-                            approved = (
-                                database.approve_fir_draft(
-                                    complaint_id=active_case["id"],
-                                    officer_user_id=reviewer_id,
-                                    officer_notes=reviewer_notes
-                                    or "Approved in the demonstration review workflow.",
-                                )
-                                if saved
-                                else False
+                            approved_case = database.get_complaint_by_id(
+                                active_case["id"],
+                                actor_user_id=reviewer_id,
                             )
-                        except sqlite3.Error as exc:
-                            st.error(_safe_error_message(exc))
-                        else:
-                            if approved:
-                                st.success(
-                                    "Draft approved in the demonstration workflow. "
-                                    "This is not legal registration or official filing."
-                                )
+                            approved_draft = database.get_latest_fir_draft(
+                                active_case["id"],
+                                actor_user_id=reviewer_id,
+                            )
+                            approval_persisted = (
+                                approved
+                                and approved_case is not None
+                                and bool(approved_case.get("is_approved"))
+                                and approved_case.get("fir_status") == "Approved"
+                                and approved_draft is not None
+                                and approved_draft.get("status") == "Approved"
+                            )
+                            if not approval_persisted:
+                                st.session_state[
+                                    "police_draft_action_feedback"
+                                ] = {
+                                    "complaint_id": active_case["id"],
+                                    "message": (
+                                        "Approval was not saved. The current "
+                                        "database status is not approved; "
+                                        "check the status and try again."
+                                    ),
+                                }
                                 st.rerun()
-                            else:
-                                st.error("The draft could not be approved.")
+                        except (sqlite3.Error, database.AuthorizationError) as exc:
+                            st.session_state[
+                                "police_draft_action_feedback"
+                            ] = {
+                                "complaint_id": active_case["id"],
+                                "message": (
+                                    "Approval could not be confirmed. Check "
+                                    "the current saved status before trying "
+                                    "again. "
+                                    f"{_safe_error_message(exc)}"
+                                ),
+                            }
+                            st.rerun()
+                        else:
+                            st.rerun()
 
                 with action_col2:
                     if st.button(
@@ -2571,23 +2785,14 @@ def render_police_dashboard() -> None:
                             st.error("Enter a reason before returning the draft.")
                         else:
                             try:
-                                saved = database.update_fir_draft(
+                                returned = database.review_fir_draft(
                                     complaint_id=active_case["id"],
-                                    draft_content_ml=draft_text,
                                     reviewer_user_id=reviewer_id,
+                                    decision="return",
+                                    draft_content_ml=draft_text,
                                     reviewer_notes=reviewer_notes,
-                                    status="Pending Police Approval",
                                 )
-                                returned = (
-                                    database.return_complaint_for_correction(
-                                        complaint_id=active_case["id"],
-                                        officer_user_id=reviewer_id,
-                                        reason=reviewer_notes,
-                                    )
-                                    if saved
-                                    else False
-                                )
-                            except sqlite3.Error as exc:
+                            except (sqlite3.Error, database.AuthorizationError) as exc:
                                 st.error(_safe_error_message(exc))
                             else:
                                 if returned:
@@ -2595,6 +2800,18 @@ def render_police_dashboard() -> None:
                                     st.rerun()
                                 else:
                                     st.error("The draft could not be returned.")
+
+
+def _open_police_case(complaint_id: Optional[int]) -> None:
+    """Stores the selected complaint and opens its case-detail tab."""
+    if complaint_id is None:
+        st.session_state["police_review_feedback"] = (
+            "Select a submitted complaint before choosing Inspect & Review."
+        )
+        return
+
+    st.session_state["active_police_case_id"] = complaint_id
+    st.session_state["police_dashboard_tabs"] = "Case details"
 
 
 # ==============================================================================
@@ -2656,6 +2873,73 @@ def _render_case_summary(case: Dict[str, Any]) -> None:
 # ADMINISTRATOR DASHBOARD
 # ==============================================================================
 
+def _admin_role_update_feedback(
+    user_id: int,
+    requested_role: str,
+    admin_user_id: int,
+) -> Dict[str, str]:
+    """Returns feedback only after reading the confirmed database role."""
+    try:
+        users = database.get_all_users(admin_user_id=admin_user_id)
+        target = next((user for user in users if user["id"] == user_id), None)
+        if target is None:
+            return {
+                "level": "error",
+                "message": "The selected account could not be found.",
+            }
+        if target["role"] == requested_role:
+            return {
+                "level": "info",
+                "message": (
+                    "No role change was needed. The account already has the "
+                    f"role: {target['role']}."
+                ),
+            }
+
+        updated = database.update_user_role(
+            user_id=user_id,
+            new_role=requested_role,
+            admin_user_id=admin_user_id,
+        )
+        confirmed_users = database.get_all_users(admin_user_id=admin_user_id)
+        confirmed = next(
+            (user for user in confirmed_users if user["id"] == user_id),
+            None,
+        )
+        if confirmed is None:
+            return {
+                "level": "error",
+                "message": "The role update could not be confirmed. Refresh and try again.",
+            }
+        if updated and confirmed["role"] == requested_role:
+            return {
+                "level": "success",
+                "message": (
+                    "Role updated successfully. The account now has the "
+                    f"role: {confirmed['role']}."
+                ),
+            }
+        if confirmed["role"] == requested_role:
+            return {
+                "level": "info",
+                "message": (
+                    "No role change was needed. The account already has the "
+                    f"role: {confirmed['role']}."
+                ),
+            }
+        return {
+            "level": "error",
+            "message": (
+                "The role update was not applied. The account remains assigned "
+                f"the role: {confirmed['role']}."
+            ),
+        }
+    except (sqlite3.Error, database.AuthorizationError) as exc:
+        return {"level": "error", "message": _safe_error_message(exc)}
+    except Exception as exc:
+        return {"level": "error", "message": _safe_error_message(exc)}
+
+
 def render_admin_dashboard() -> None:
     """Displays administrative controls and system status."""
     if not _require_role(["admin"]):
@@ -2678,8 +2962,8 @@ def render_admin_dashboard() -> None:
     with tab_users:
         st.markdown("### User management")
         try:
-            users = database.get_all_users()
-        except sqlite3.Error as exc:
+            users = database.get_all_users(admin_user_id=admin["id"])
+        except (sqlite3.Error, database.AuthorizationError) as exc:
             st.error(_safe_error_message(exc))
             users = []
 
@@ -2713,28 +2997,42 @@ def render_admin_dashboard() -> None:
                 key="admin_new_role",
             )
             if st.button("Update role", key="admin_update_role"):
-                try:
-                    updated = database.update_user_role(
+                st.session_state.pop("admin_role_update_feedback", None)
+                st.session_state["admin_role_update_feedback"] = (
+                    _admin_role_update_feedback(
                         user_id=user_labels[selected_user],
-                        new_role=selected_role,
+                        requested_role=selected_role,
                         admin_user_id=admin["id"],
                     )
-                except sqlite3.Error as exc:
-                    st.error(_safe_error_message(exc))
-                else:
-                    if updated:
-                        st.success("Account role updated.")
-                        st.rerun()
-                    else:
-                        st.error("The account role was not changed.")
+                )
+                st.rerun()
+
+            role_feedback = st.session_state.get(
+                "admin_role_update_feedback"
+            )
+            if role_feedback:
+                display_feedback = {
+                    "success": st.success,
+                    "info": st.info,
+                    "error": st.error,
+                }.get(role_feedback.get("level"), st.error)
+                display_feedback(
+                    role_feedback.get(
+                        "message",
+                        "Role update could not be confirmed.",
+                    )
+                )
         else:
             st.info("No user records are available.")
 
     with tab_audit:
         st.markdown("### Audit logs")
         try:
-            audit_logs = database.get_audit_logs(limit=100)
-        except sqlite3.Error as exc:
+            audit_logs = database.get_audit_logs(
+                admin_user_id=admin["id"],
+                limit=100,
+            )
+        except (sqlite3.Error, database.AuthorizationError) as exc:
             st.error(_safe_error_message(exc))
         else:
             if audit_logs:
@@ -2748,28 +3046,34 @@ def render_admin_dashboard() -> None:
 
     with tab_health:
         st.markdown("#### Platform Health & Subsystems")
+        if st.button("Recheck platform health", key="admin_health_recheck") or (
+            "admin_platform_health_results" not in st.session_state
+        ):
+            try:
+                st.session_state["admin_platform_health_results"] = (
+                    platform_health.run_platform_health_checks()
+                )
+            except Exception:
+                st.session_state["admin_platform_health_results"] = [{
+                    "component": "Platform checks",
+                    "status": "Unknown",
+                    "detail": "Health checks could not be completed.",
+                    "checked_at": datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                }]
 
-        c1, c2, c3 = st.columns(3)
+        for check in st.session_state.get("admin_platform_health_results", []):
+            with st.container(border=True):
+                name_col, status_col = st.columns([3, 1])
+                with name_col:
+                    st.markdown(f"**{escape(check['component'])}**")
+                    st.write(check["detail"])
+                    st.caption(f"Last checked: {check['checked_at']}")
+                with status_col:
+                    st.markdown(f"**{escape(check['status'])}**")
 
-        with c1:
-            st.metric(
-                "Database Storage",
-                "SQLite Relational (Operational)",
-            )
-
-        with c2:
-            st.metric(
-                "Complaint Intake Engine",
-                "Multilingual Chat & Form Fallback",
-            )
-
-        with c3:
-            st.metric(
-                "Malayalam FIR Engine",
-                "Draft generator configured",
-            )
-
-        st.info(
+        st.caption(
             "Missing-person records and CCTV video processing are later "
             "roadmap milestones. Do not treat these features as implemented "
             "until their modules are integrated and tested."
@@ -2792,7 +3096,7 @@ def main() -> None:
     init_session_state()
 
     page_definitions = {
-        "landing": ("FIR Assistance System", render_landing_page),
+        "landing": ("FIR Assistance System", render_application_root),
         "language_select": ("Choose your language", render_language_select),
         "complaint_chat": ("Complaint conversation", render_complaint_chat),
         "complaint_guided_form": ("Complaint details", render_guided_form),

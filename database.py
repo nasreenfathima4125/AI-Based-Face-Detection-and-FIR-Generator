@@ -13,16 +13,64 @@ Manages relational persistence across application restarts:
 from datetime import datetime, timedelta, timezone
 import hashlib
 from contextlib import contextmanager
+import logging
+import math
 import os
 import secrets
 import sqlite3
 from typing import Dict, Any, List, Optional, Tuple, Generator
+
+
+_LOGGER = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("FIR_SYSTEM_DB_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "fir_system.db",
 )
 RECOVERY_HANDLE_TTL_SECONDS = 24 * 60 * 60
+PUBLIC_LOOKUP_RATE_LIMIT_DEFAULT = 10
+PUBLIC_LOOKUP_RATE_WINDOW_SECONDS_DEFAULT = 15 * 60
+PUBLIC_LOOKUP_RATE_LIMIT_MAX = 100
+PUBLIC_LOOKUP_RATE_WINDOW_SECONDS_MAX = 24 * 60 * 60
+
+
+class AuthorizationError(PermissionError):
+    """Raised when a database operation is requested by the wrong role."""
+
+
+def _require_role(
+    conn: sqlite3.Connection,
+    user_id: Optional[int],
+    allowed_roles: set[str],
+) -> sqlite3.Row:
+    """Loads an actor's current database role and denies access by default."""
+    if user_id is None:
+        raise AuthorizationError("Access denied.")
+    row = conn.execute(
+        "SELECT id, role FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None or row["role"] not in allowed_roles:
+        raise AuthorizationError("Access denied.")
+    return row
+
+
+def _require_complaint_access(
+    conn: sqlite3.Connection,
+    complaint_id: int,
+    actor_user_id: Optional[int],
+) -> Optional[sqlite3.Row]:
+    """Allows police reviewers or the citizen who owns this complaint."""
+    actor = _require_role(conn, actor_user_id, {"citizen", "police"})
+    complaint = conn.execute(
+        "SELECT citizen_user_id FROM complaints WHERE id = ?",
+        (complaint_id,),
+    ).fetchone()
+    if complaint is None:
+        return None
+    if actor["role"] == "citizen" and complaint["citizen_user_id"] != actor["id"]:
+        raise AuthorizationError("Access denied.")
+    return complaint
 
 
 @contextmanager
@@ -54,7 +102,7 @@ def verify_password(password: str, stored_hash: str, salt: str) -> bool:
 
 
 def init_db() -> None:
-    """Initializes the database schema and seeds default demonstration accounts."""
+    """Initializes the schema; demo accounts require explicit opt-in."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -173,6 +221,37 @@ def init_db() -> None:
             """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public_complaint_lookup_limits (
+                client_key_hash TEXT PRIMARY KEY,
+                window_started_at REAL NOT NULL,
+                attempt_count INTEGER NOT NULL CHECK (attempt_count > 0)
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id
+            ON auth_sessions (user_id)
+            """
+        )
+
         # 3. FIR Drafts table
         cursor.execute(
             """
@@ -209,8 +288,13 @@ def init_db() -> None:
 
         conn.commit()
 
-        # Seed initial accounts if not present
-        _seed_users(cursor, conn)
+        # Privileged demonstration accounts are only for explicit local/test use.
+        enable_demo_accounts = os.environ.get(
+            "FIR_ENABLE_DEMO_ACCOUNTS",
+            "false",
+        ).strip().lower() == "true"
+        if enable_demo_accounts:
+            _seed_users(cursor, conn)
 
 
 def _seed_users(cursor: sqlite3.Cursor, conn: sqlite3.Connection) -> None:
@@ -244,8 +328,9 @@ def create_user(
     password: str,
     contact_number: str = "",
     role: str = "citizen",
+    created_by_user_id: Optional[int] = None,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-    """Registers a new user account with validated credentials and hashed password."""
+    """Creates a citizen account or an admin-authorized privileged account."""
     cleaned_email = (email or "").strip().lower()
     cleaned_name = (full_name or "").strip()
     cleaned_phone = (contact_number or "").strip()
@@ -256,13 +341,15 @@ def create_user(
         return False, "Full name must be at least 2 characters long.", None
     if len(password) < 6:
         return False, "Password must be at least 6 characters long.", None
-    if role not in ["citizen", "police", "admin"]:
+    if role not in {"citizen", "police", "admin"}:
         role = "citizen"
 
     pwd_hash, salt = hash_password(password)
 
     try:
         with get_db_connection() as conn:
+            if role != "citizen":
+                _require_role(conn, created_by_user_id, {"admin"})
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -277,7 +364,7 @@ def create_user(
             # Record audit event
             log_audit(
                 complaint_id=None,
-                actor_user_id=user_id,
+                actor_user_id=created_by_user_id or user_id,
                 action="USER_REGISTRATION",
                 details=f"User {cleaned_email} registered with role {role}.",
             )
@@ -289,6 +376,8 @@ def create_user(
                 "contact_number": cleaned_phone,
                 "role": role,
             }
+    except AuthorizationError:
+        return False, "Privileged role assignment is not authorized.", None
     except sqlite3.IntegrityError:
         return False, "An account with this email already exists.", None
     except Exception as e:
@@ -327,36 +416,153 @@ def authenticate_user(email: str, password: str) -> Tuple[bool, str, Optional[Di
             return False, "Invalid email or password.", None
 
 
-def get_all_users() -> List[Dict[str, Any]]:
+def create_auth_session(
+    token_hash: str,
+    user_id: int,
+    created_at: str,
+    expires_at: str,
+) -> None:
+    """Stores a hash of a new opaque authentication token."""
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO auth_sessions
+                (token_hash, user_id, created_at, expires_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (token_hash, user_id, created_at, expires_at, created_at),
+        )
+        conn.commit()
+
+
+def get_auth_session_user(
+    token_hash: str,
+    now: str,
+) -> Optional[Dict[str, Any]]:
+    """Validates a session and returns the user's current database record."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT s.id AS session_id, s.expires_at, s.revoked_at,
+                   u.id, u.email, u.full_name, u.contact_number, u.role
+            FROM auth_sessions AS s
+            JOIN users AS u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None:
+            return None
+
+        try:
+            expires_at = datetime.fromisoformat(str(row["expires_at"]))
+            current_time = datetime.fromisoformat(now)
+        except ValueError:
+            conn.execute(
+                """
+                UPDATE auth_sessions
+                SET revoked_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (now, row["session_id"]),
+            )
+            conn.commit()
+            return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        if expires_at <= current_time:
+            conn.execute(
+                """
+                UPDATE auth_sessions
+                SET revoked_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (now, row["session_id"]),
+            )
+            conn.commit()
+            return None
+
+        conn.execute(
+            "UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?",
+            (now, row["session_id"]),
+        )
+        conn.commit()
+        return {
+            "id": row["id"],
+            "email": row["email"],
+            "full_name": row["full_name"],
+            "contact_number": row["contact_number"],
+            "role": row["role"],
+        }
+
+
+def revoke_auth_session(token_hash: str, revoked_at: str) -> bool:
+    """Revokes an active authentication session by its token hash."""
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE auth_sessions
+            SET revoked_at = ?
+            WHERE token_hash = ? AND revoked_at IS NULL
+            """,
+            (revoked_at, token_hash),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_all_users(admin_user_id: int) -> List[Dict[str, Any]]:
     """Retrieves all registered users for administrative management."""
     with get_db_connection() as conn:
+        _require_role(conn, admin_user_id, {"admin"})
         cursor = conn.cursor()
         cursor.execute("SELECT id, email, full_name, contact_number, role, created_at FROM users ORDER BY id ASC")
         return [dict(row) for row in cursor.fetchall()]
 
 
-def update_user_role(user_id: int, new_role: str, admin_user_id: Optional[int] = None) -> bool:
-    """Updates user role (administrator authorization required)."""
-    if new_role not in ["citizen", "police", "admin"]:
+def update_user_role(user_id: int, new_role: str, admin_user_id: int) -> bool:
+    """Changes a role only for an administrator, preserving a last admin."""
+    if new_role not in {"citizen", "police", "admin"}:
         return False
     with get_db_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_role(conn, admin_user_id, {"admin"})
         cursor = conn.cursor()
+        target = cursor.execute(
+            "SELECT role FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if target is None:
+            return False
+        if target["role"] == new_role:
+            return False
+        if target["role"] == "admin" and new_role != "admin":
+            admin_count = cursor.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+            ).fetchone()[0]
+            if admin_count <= 1:
+                return False
         cursor.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
+        changed = cursor.rowcount > 0
         conn.commit()
+        if not changed:
+            return False
         log_audit(
             complaint_id=None,
             actor_user_id=admin_user_id,
             action="ROLE_CHANGE",
             details=f"User ID {user_id} role updated to {new_role}.",
         )
-        return cursor.rowcount > 0
+        return True
 
 
 # ==============================================================================
 # COMPLAINT & FIR OPERATIONS
 # ==============================================================================
 def generate_reference_number() -> str:
-    """Generates an official, unique complaint reference identifier."""
+    """Generates a unique complaint reference for this prototype."""
     today_str = datetime.now().strftime("%Y%m%d")
     random_suffix = secrets.token_hex(3).upper()
     return f"CMP-{today_str}-{random_suffix}"
@@ -385,6 +591,8 @@ def save_complaint(
     verification_token = secrets.token_hex(2).upper()
 
     with get_db_connection() as conn:
+        if citizen_user_id is not None:
+            _require_role(conn, citizen_user_id, {"citizen"})
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -445,37 +653,167 @@ def save_complaint(
                 (complaint_id, recovery_handle_hash, recovery_expires_at),
             )
 
-        conn.commit()
-
-        # Audit log
-        log_audit(
+        if not log_audit(
             complaint_id=complaint_id,
             actor_user_id=citizen_user_id,
             action="COMPLAINT_SUBMITTED",
             details=f"Complaint {ref_no} submitted in {intake_language}. Category: {category}.",
-        )
+            connection=conn,
+        ):
+            raise sqlite3.DatabaseError("The complaint audit entry could not be saved.")
 
-        record = get_complaint_by_id(complaint_id)
+        conn.commit()
+
+        record = _get_complaint_record(conn, complaint_id)
         return True, "Complaint persisted successfully.", record or {}
 
 
-def get_complaint_by_id(complaint_id: int) -> Optional[Dict[str, Any]]:
-    """Retrieves full complaint record by primary key."""
+def _get_complaint_record(
+    conn: sqlite3.Connection,
+    complaint_id: int,
+) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM complaints WHERE id = ?",
+        (complaint_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_complaint_by_id(
+    complaint_id: int,
+    actor_user_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Retrieves a complaint only for its citizen owner or police reviewer."""
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        _require_complaint_access(conn, complaint_id, actor_user_id)
+        return _get_complaint_record(conn, complaint_id)
 
 
-def get_complaint_by_reference(reference_no: str) -> Optional[Dict[str, Any]]:
-    """Retrieves complaint record by public reference number."""
+def get_complaint_by_reference(
+    reference_no: str,
+    contact_number: str,
+) -> Optional[Dict[str, Any]]:
+    """Returns only tracking fields after verifying the supplied contact."""
     cleaned = (reference_no or "").strip().upper()
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM complaints WHERE reference_no = ?", (cleaned,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        row = conn.execute(
+            """
+            SELECT id, reference_no, contact_number, status, fir_status
+            FROM complaints
+            WHERE reference_no = ?
+            """,
+            (cleaned,),
+        ).fetchone()
+        if row is None or re_clean_phone(row["contact_number"]) != re_clean_phone(
+            contact_number
+        ):
+            return None
+        return {
+            key: row[key]
+            for key in ("id", "reference_no", "status", "fir_status")
+        }
+
+
+def _public_lookup_rate_limit_settings() -> Tuple[int, int]:
+    """Reads and bounds the public lookup attempt count and fixed window."""
+    try:
+        max_attempts = int(
+            os.environ.get(
+                "FIR_PUBLIC_LOOKUP_RATE_LIMIT",
+                str(PUBLIC_LOOKUP_RATE_LIMIT_DEFAULT),
+            )
+        )
+        window_seconds = int(
+            os.environ.get(
+                "FIR_PUBLIC_LOOKUP_RATE_WINDOW_SECONDS",
+                str(PUBLIC_LOOKUP_RATE_WINDOW_SECONDS_DEFAULT),
+            )
+        )
+    except ValueError as exc:
+        raise ValueError("Public complaint lookup rate-limit settings are invalid.") from exc
+
+    if not 1 <= max_attempts <= PUBLIC_LOOKUP_RATE_LIMIT_MAX:
+        raise ValueError("FIR_PUBLIC_LOOKUP_RATE_LIMIT must be between 1 and 100.")
+    if not 1 <= window_seconds <= PUBLIC_LOOKUP_RATE_WINDOW_SECONDS_MAX:
+        raise ValueError(
+            "FIR_PUBLIC_LOOKUP_RATE_WINDOW_SECONDS must be between 1 and 86400."
+        )
+    return max_attempts, window_seconds
+
+
+def reserve_public_complaint_lookup(
+    client_key_hash: str,
+    now: Optional[datetime] = None,
+) -> Optional[int]:
+    """Atomically consumes one IP-keyed lookup attempt, or returns retry seconds.
+
+    Only a keyed digest of a trusted client identity is persisted. A SQLite
+    immediate transaction serializes concurrent workers that share this DB.
+    """
+    if (
+        not isinstance(client_key_hash, str)
+        or len(client_key_hash) != 64
+        or any(character not in "0123456789abcdef" for character in client_key_hash)
+    ):
+        raise ValueError("A valid public lookup client digest is required.")
+
+    max_attempts, window_seconds = _public_lookup_rate_limit_settings()
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_timestamp = current_time.astimezone(timezone.utc).timestamp()
+    cutoff = current_timestamp - window_seconds
+
+    with get_db_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # Each request opportunistically removes expired identities. A key has
+        # only one row, so quiet clients do not accumulate repeated entries.
+        conn.execute(
+            "DELETE FROM public_complaint_lookup_limits WHERE window_started_at <= ?",
+            (cutoff,),
+        )
+        row = conn.execute(
+            """
+            SELECT window_started_at, attempt_count
+            FROM public_complaint_lookup_limits
+            WHERE client_key_hash = ?
+            """,
+            (client_key_hash,),
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO public_complaint_lookup_limits (
+                    client_key_hash, window_started_at, attempt_count
+                ) VALUES (?, ?, 1)
+                """,
+                (client_key_hash, current_timestamp),
+            )
+            conn.commit()
+            return None
+
+        if row["attempt_count"] >= max_attempts:
+            retry_after = max(
+                1,
+                math.ceil(
+                    window_seconds
+                    - (current_timestamp - row["window_started_at"])
+                ),
+            )
+            conn.commit()
+            return retry_after
+
+        conn.execute(
+            """
+            UPDATE public_complaint_lookup_limits
+            SET attempt_count = attempt_count + 1
+            WHERE client_key_hash = ?
+            """,
+            (client_key_hash,),
+        )
+        conn.commit()
+        return None
 
 
 def get_recovery_challenge(handle_hash: str) -> Optional[Dict[str, Any]]:
@@ -745,9 +1083,15 @@ def verify_recovery_otp(
         return "locked" if locked_until else "invalid"
 
 
-def get_complaints_for_citizen(citizen_user_id: int) -> List[Dict[str, Any]]:
+def get_complaints_for_citizen(
+    citizen_user_id: int,
+    requesting_user_id: int,
+) -> List[Dict[str, Any]]:
     """Retrieves all complaints owned by or linked to a specific citizen account."""
     with get_db_connection() as conn:
+        _require_role(conn, requesting_user_id, {"citizen"})
+        if requesting_user_id != citizen_user_id:
+            raise AuthorizationError("Access denied.")
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -761,11 +1105,28 @@ def get_complaints_for_citizen(citizen_user_id: int) -> List[Dict[str, Any]]:
 
 
 def get_all_complaints_for_police(
+    police_user_id: int,
     status_filter: Optional[str] = None,
     category_filter: Optional[str] = None,
     search_query: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieves complaints queue for police officers with flexible filtering and search."""
+    with get_db_connection() as conn:
+        _require_role(conn, police_user_id, {"police"})
+        return _get_all_complaints_for_police(
+            conn,
+            status_filter,
+            category_filter,
+            search_query,
+        )
+
+
+def _get_all_complaints_for_police(
+    conn: sqlite3.Connection,
+    status_filter: Optional[str],
+    category_filter: Optional[str],
+    search_query: Optional[str],
+) -> List[Dict[str, Any]]:
     query = "SELECT * FROM complaints WHERE 1=1"
     params: List[Any] = []
 
@@ -784,15 +1145,18 @@ def get_all_complaints_for_police(
 
     query += " ORDER BY id DESC"
 
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        return [dict(row) for row in cursor.fetchall()]
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    return [dict(row) for row in cursor.fetchall()]
 
 
-def get_latest_fir_draft(complaint_id: int) -> Optional[Dict[str, Any]]:
+def get_latest_fir_draft(
+    complaint_id: int,
+    actor_user_id: int,
+) -> Optional[Dict[str, Any]]:
     """Fetches the latest FIR draft for a given complaint."""
     with get_db_connection() as conn:
+        _require_complaint_access(conn, complaint_id, actor_user_id)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -807,6 +1171,177 @@ def get_latest_fir_draft(complaint_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def get_approved_fir_draft_for_citizen(
+    complaint_id: int,
+    citizen_user_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Returns the latest approved document only to its owning citizen."""
+    with get_db_connection() as conn:
+        _require_role(conn, citizen_user_id, {"citizen"})
+        complaint = conn.execute(
+            """
+            SELECT citizen_user_id, is_approved, fir_status
+            FROM complaints
+            WHERE id = ?
+            """,
+            (complaint_id,),
+        ).fetchone()
+        if complaint is None:
+            return None
+        if complaint["citizen_user_id"] != citizen_user_id:
+            raise AuthorizationError("Access denied.")
+        if not complaint["is_approved"] or complaint["fir_status"] != "Approved":
+            return None
+
+        draft = conn.execute(
+            """
+            SELECT * FROM fir_drafts
+            WHERE complaint_id = ?
+            ORDER BY version DESC, id DESC
+            LIMIT 1
+            """,
+            (complaint_id,),
+        ).fetchone()
+        if (
+            draft is None
+            or draft["status"] != "Approved"
+            or draft["reviewed_by_user_id"] is None
+        ):
+            return None
+
+        approval_audit = conn.execute(
+            """
+            SELECT 1 FROM audit_logs
+            WHERE complaint_id = ?
+              AND actor_user_id = ?
+              AND action = 'FIR_APPROVED'
+            LIMIT 1
+            """,
+            (complaint_id, draft["reviewed_by_user_id"]),
+        ).fetchone()
+        if approval_audit is None:
+            return None
+        return dict(draft)
+
+
+def review_fir_draft(
+    complaint_id: int,
+    reviewer_user_id: int,
+    decision: str,
+    draft_content_ml: Optional[str] = None,
+    reviewer_notes: str = "",
+) -> bool:
+    """Saves draft content and a police decision atomically."""
+    if decision not in {"save", "approve", "return"}:
+        return False
+    if decision == "return" and not reviewer_notes.strip():
+        return False
+
+    with get_db_connection() as conn:
+        _require_role(conn, reviewer_user_id, {"police"})
+        _require_complaint_access(conn, complaint_id, reviewer_user_id)
+        draft = conn.execute(
+            """
+            SELECT id, draft_content_ml FROM fir_drafts
+            WHERE complaint_id = ?
+            ORDER BY version DESC, id DESC
+            LIMIT 1
+            """,
+            (complaint_id,),
+        ).fetchone()
+        if draft is None:
+            return False
+
+        content = (
+            draft["draft_content_ml"]
+            if draft_content_ml is None
+            else draft_content_ml
+        )
+        if decision == "approve" and not content.strip():
+            return False
+
+        statuses = {
+            "save": "Pending Police Approval",
+            "approve": "Approved",
+            "return": "Returned for Correction",
+        }
+        status = statuses[decision]
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE fir_drafts
+            SET draft_content_ml = ?, status = ?, reviewed_by_user_id = ?,
+                reviewer_notes = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (content, status, reviewer_user_id, reviewer_notes, draft["id"]),
+        )
+        if cursor.rowcount != 1:
+            return False
+
+        if decision == "approve":
+            cursor.execute(
+                """
+                UPDATE complaints
+                SET is_approved = 1,
+                    status = 'Accepted for Further Processing',
+                    fir_status = 'Approved',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (complaint_id,),
+            )
+            audit_action = "FIR_APPROVED"
+            audit_details = (
+                f"FIR draft approved for case ID {complaint_id}. "
+                "Citizen download unlocked."
+            )
+        elif decision == "return":
+            cursor.execute(
+                """
+                UPDATE complaints
+                SET is_approved = 0,
+                    status = 'More Information Required',
+                    fir_status = 'Returned for Correction',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (complaint_id,),
+            )
+            audit_action = "RETURNED_FOR_CORRECTION"
+            audit_details = f"Complaint returned for correction. Reason: {reviewer_notes}"
+        else:
+            cursor.execute(
+                """
+                UPDATE complaints
+                SET is_approved = 0,
+                    status = CASE
+                        WHEN is_approved = 1 THEN 'Submitted'
+                        ELSE status
+                    END,
+                    fir_status = 'Pending Police Approval',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (complaint_id,),
+            )
+            audit_action = "FIR_DRAFT_UPDATED"
+            audit_details = f"FIR draft updated. Status: {status}. Notes: {reviewer_notes}"
+
+        if cursor.rowcount != 1:
+            return False
+        if not log_audit(
+            complaint_id=complaint_id,
+            actor_user_id=reviewer_user_id,
+            action=audit_action,
+            details=audit_details,
+            connection=conn,
+        ):
+            raise sqlite3.DatabaseError("The review audit entry could not be saved.")
+        conn.commit()
+        return True
+
+
 def update_fir_draft(
     complaint_id: int,
     draft_content_ml: str,
@@ -815,33 +1350,15 @@ def update_fir_draft(
     status: str = "Pending Police Approval",
 ) -> bool:
     """Updates the Malayalam FIR draft content and saves revision."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE fir_drafts 
-            SET draft_content_ml = ?, status = ?, reviewed_by_user_id = ?, reviewer_notes = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE complaint_id = ?
-            """,
-            (draft_content_ml, status, reviewer_user_id, reviewer_notes, complaint_id),
-        )
-        cursor.execute(
-            """
-            UPDATE complaints 
-            SET fir_status = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (status, complaint_id),
-        )
-        conn.commit()
-
-        log_audit(
-            complaint_id=complaint_id,
-            actor_user_id=reviewer_user_id,
-            action="FIR_DRAFT_UPDATED",
-            details=f"FIR draft updated. Status: {status}. Notes: {reviewer_notes}",
-        )
-        return True
+    if status != "Pending Police Approval":
+        return False
+    return review_fir_draft(
+        complaint_id=complaint_id,
+        reviewer_user_id=reviewer_user_id,
+        decision="save",
+        draft_content_ml=draft_content_ml,
+        reviewer_notes=reviewer_notes,
+    )
 
 
 def update_complaint_status(
@@ -852,6 +1369,8 @@ def update_complaint_status(
 ) -> bool:
     """Updates case review status (e.g., Pending Review, Under Review, More Information Required, Closed)."""
     with get_db_connection() as conn:
+        _require_role(conn, officer_user_id, {"police"})
+        _require_complaint_access(conn, complaint_id, officer_user_id)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -861,14 +1380,17 @@ def update_complaint_status(
             """,
             (new_status, complaint_id),
         )
-        conn.commit()
-
-        log_audit(
+        if cursor.rowcount != 1:
+            return False
+        if not log_audit(
             complaint_id=complaint_id,
             actor_user_id=officer_user_id,
             action="STATUS_CHANGE",
             details=f"Complaint status updated to '{new_status}'. Officer notes: {notes}",
-        )
+            connection=conn,
+        ):
+            raise sqlite3.DatabaseError("The status audit entry could not be saved.")
+        conn.commit()
         return True
 
 
@@ -878,33 +1400,12 @@ def approve_fir_draft(
     officer_notes: str = "Approved by Station Reviewer",
 ) -> bool:
     """Marks FIR draft as approved by authorized police personnel and unlocks download."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE complaints 
-            SET is_approved = 1, status = 'Accepted for Further Processing', fir_status = 'Approved', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (complaint_id,),
-        )
-        cursor.execute(
-            """
-            UPDATE fir_drafts 
-            SET status = 'Approved', reviewed_by_user_id = ?, reviewer_notes = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE complaint_id = ?
-            """,
-            (officer_user_id, officer_notes, complaint_id),
-        )
-        conn.commit()
-
-        log_audit(
-            complaint_id=complaint_id,
-            actor_user_id=officer_user_id,
-            action="FIR_APPROVED",
-            details=f"FIR draft approved for case ID {complaint_id}. Citizen download unlocked.",
-        )
-        return True
+    return review_fir_draft(
+        complaint_id=complaint_id,
+        reviewer_user_id=officer_user_id,
+        decision="approve",
+        reviewer_notes=officer_notes,
+    )
 
 
 def return_complaint_for_correction(
@@ -913,33 +1414,12 @@ def return_complaint_for_correction(
     reason: str,
 ) -> bool:
     """Returns complaint to citizen for correction with mandatory recorded reason."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE complaints 
-            SET status = 'More Information Required', fir_status = 'Returned for Correction', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (complaint_id,),
-        )
-        cursor.execute(
-            """
-            UPDATE fir_drafts 
-            SET status = 'Returned for Correction', reviewed_by_user_id = ?, reviewer_notes = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE complaint_id = ?
-            """,
-            (officer_user_id, reason, complaint_id),
-        )
-        conn.commit()
-
-        log_audit(
-            complaint_id=complaint_id,
-            actor_user_id=officer_user_id,
-            action="RETURNED_FOR_CORRECTION",
-            details=f"Complaint returned for correction. Reason: {reason}",
-        )
-        return True
+    return review_fir_draft(
+        complaint_id=complaint_id,
+        reviewer_user_id=officer_user_id,
+        decision="return",
+        reviewer_notes=reason,
+    )
 
 
 def link_complaint_to_citizen(
@@ -956,6 +1436,7 @@ def link_complaint_to_citizen(
     cleaned_phone = re_clean_phone(contact_number)
 
     with get_db_connection() as conn:
+        _require_role(conn, citizen_user_id, {"citizen"})
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM complaints WHERE reference_no = ?", (cleaned_ref,))
         row = cursor.fetchone()
@@ -973,18 +1454,21 @@ def link_complaint_to_citizen(
             """
             UPDATE complaints 
             SET citizen_user_id = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
+            WHERE id = ? AND (citizen_user_id IS NULL OR citizen_user_id = ?)
             """,
-            (citizen_user_id, row["id"]),
+            (citizen_user_id, row["id"], citizen_user_id),
         )
-        conn.commit()
-
-        log_audit(
+        if cursor.rowcount != 1:
+            return False, "Complaint record could not be linked to this account."
+        if not log_audit(
             complaint_id=row["id"],
             actor_user_id=citizen_user_id,
             action="COMPLAINT_LINKED",
             details=f"Complaint {cleaned_ref} verified and linked to Citizen User ID {citizen_user_id}.",
-        )
+            connection=conn,
+        ):
+            raise sqlite3.DatabaseError("The complaint-link audit entry could not be saved.")
+        conn.commit()
         return True, "Complaint successfully verified and linked to your citizen dashboard."
 
 
@@ -997,31 +1481,63 @@ def re_clean_phone(phone: str) -> str:
 # ==============================================================================
 # AUDIT LOGGING
 # ==============================================================================
-def log_audit(
+def _insert_audit_log(
+    cursor: sqlite3.Cursor,
     complaint_id: Optional[int],
     actor_user_id: Optional[int],
     action: str,
     details: str,
 ) -> None:
+    cursor.execute(
+        """
+        INSERT INTO audit_logs (complaint_id, actor_user_id, action, details)
+        VALUES (?, ?, ?, ?)
+        """,
+        (complaint_id, actor_user_id, action, details),
+    )
+
+
+def log_audit(
+    complaint_id: Optional[int],
+    actor_user_id: Optional[int],
+    action: str,
+    details: str,
+    connection: Optional[sqlite3.Connection] = None,
+) -> bool:
     """Appends an immutable audit log entry."""
     try:
+        if connection is not None:
+            _insert_audit_log(
+                connection.cursor(),
+                complaint_id,
+                actor_user_id,
+                action,
+                details,
+            )
+            return True
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO audit_logs (complaint_id, actor_user_id, action, details)
-                VALUES (?, ?, ?, ?)
-                """,
-                (complaint_id, actor_user_id, action, details),
+            _insert_audit_log(
+                conn.cursor(),
+                complaint_id,
+                actor_user_id,
+                action,
+                details,
             )
             conn.commit()
-    except Exception as e:
-        print(f"Audit log failure: {e}")
+        return True
+    except sqlite3.Error:
+        _LOGGER.exception("Audit log write failed.")
+        return False
 
 
-def get_audit_logs(complaint_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+def get_audit_logs(
+    admin_user_id: int,
+    complaint_id: Optional[int] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
     """Retrieves recent audit logs, optionally filtered by complaint."""
     with get_db_connection() as conn:
+        _require_role(conn, admin_user_id, {"admin"})
         cursor = conn.cursor()
         if complaint_id:
             cursor.execute(
@@ -1048,6 +1564,25 @@ def get_audit_logs(complaint_id: Optional[int] = None, limit: int = 50) -> List[
                 (limit,),
             )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def check_audit_logging() -> bool:
+    """Checks the audit insert path inside a transaction that is rolled back."""
+    with get_db_connection() as conn:
+        conn.execute("SAVEPOINT audit_health_check")
+        try:
+            if not log_audit(
+                complaint_id=None,
+                actor_user_id=None,
+                action="PLATFORM_HEALTH_CHECK",
+                details="Transient audit writer capability check.",
+                connection=conn,
+            ):
+                raise sqlite3.OperationalError("Audit writer check failed.")
+        finally:
+            conn.execute("ROLLBACK TO SAVEPOINT audit_health_check")
+            conn.execute("RELEASE SAVEPOINT audit_health_check")
+    return True
 
 
 # Auto-initialize database on import

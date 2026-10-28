@@ -12,6 +12,7 @@ os.environ["FIR_SYSTEM_DB_PATH"] = os.path.join(
     _IMPORT_SAFE_DIRECTORY.name,
     "import-safe.sqlite3",
 )
+os.environ["FIR_ENABLE_DEMO_ACCOUNTS"] = "true"
 
 
 def isolate_database(test_case, database_module):

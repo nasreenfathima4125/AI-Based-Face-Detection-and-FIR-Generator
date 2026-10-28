@@ -62,6 +62,15 @@ def hash_phone_for_rate_limit(secret: bytes, phone_number: str) -> str:
     ).hexdigest()
 
 
+def hash_public_lookup_client(secret: bytes, client_address: str) -> str:
+    """Creates a keyed, scope-separated client key for status lookup limits."""
+    return hmac.new(
+        secret,
+        f"public-complaint-lookup:{client_address}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def current_utc_time() -> datetime:
     """Returns a timezone-aware UTC timestamp for persisted OTP deadlines."""
     return datetime.now(timezone.utc)
